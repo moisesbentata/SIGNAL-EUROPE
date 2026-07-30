@@ -1,0 +1,11 @@
+# RSS/news sources for European VC & AI content.
+# Add/remove freely — anything with an RSS feed works.
+feeds:
+  - name: EU-Startups
+    url: https://www.eu-startups.com/feed/
+  - name: Sifted
+    url: https://sifted.eu/feed
+  - name: Tech.eu
+    url: https://tech.eu/feed/
+  - name: TechCrunch (Europe tag)
+    url: https://techcrunch.com/tag/europe/feed/
