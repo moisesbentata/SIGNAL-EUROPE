@@ -13,3 +13,4 @@ class SourceItem:
     url: str = ""          # link back to the original, used in caption
     published: str = ""    # ISO-ish date string, best effort
     tags: list = field(default_factory=list)
+    company: str = ""      # company name shown in the circular badge, if any

@@ -1,11 +1,30 @@
 # RSS/news sources for European VC & AI content.
 # Add/remove freely — anything with an RSS feed works.
+#
+# Feeds marked `europe_focused: true` are already scoped to Europe (every
+# item passes straight through). Everything else is a broad/global feed —
+# the European relevance filter (signal_europe/filters.py) runs on those
+# and drops anything not about a European company or European tech/AI/VC
+# news before it ever reaches the image generator.
 feeds:
   - name: EU-Startups
     url: https://www.eu-startups.com/feed/
+    europe_focused: true
   - name: Sifted
     url: https://sifted.eu/feed
+    europe_focused: true
   - name: Tech.eu
     url: https://tech.eu/feed/
+    europe_focused: true
   - name: TechCrunch (Europe tag)
     url: https://techcrunch.com/tag/europe/feed/
+    europe_focused: true
+  - name: TechCrunch
+    url: https://techcrunch.com/feed/
+    europe_focused: false
+  - name: The Verge
+    url: https://www.theverge.com/rss/index.xml
+    europe_focused: false
+  - name: Business Insider
+    url: https://www.businessinsider.com/rss
+    europe_focused: false

@@ -1,8 +1,10 @@
 """SQLite-backed dedup store so the pipeline never processes the same
-source item twice across runs."""
+source item twice across runs, plus a daily post counter used to enforce
+the posting cadence (see signal_europe/pipeline.py)."""
 
 import sqlite3
 from contextlib import contextmanager
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 DEFAULT_DB_PATH = Path("data/seen_items.db")
@@ -20,6 +22,14 @@ class SeenItemStore:
                     item_id TEXT NOT NULL,
                     seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (source, item_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_post_counts (
+                    post_date TEXT PRIMARY KEY,
+                    count INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -46,4 +56,24 @@ class SeenItemStore:
             conn.execute(
                 "INSERT OR IGNORE INTO seen_items (source, item_id) VALUES (?, ?)",
                 (source, item_id),
+            )
+
+    def posts_today(self, today: date = None) -> int:
+        today = today or datetime.now(timezone.utc).date()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT count FROM daily_post_counts WHERE post_date = ?",
+                (today.isoformat(),),
+            ).fetchone()
+        return row[0] if row else 0
+
+    def increment_posts_today(self, n: int = 1, today: date = None) -> None:
+        today = today or datetime.now(timezone.utc).date()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO daily_post_counts (post_date, count) VALUES (?, ?)
+                ON CONFLICT(post_date) DO UPDATE SET count = count + excluded.count
+                """,
+                (today.isoformat(), n),
             )

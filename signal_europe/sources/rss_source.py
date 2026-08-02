@@ -35,6 +35,7 @@ def fetch_new_items(feeds_path: Path = DEFAULT_FEEDS_PATH) -> list:
     items = []
     for feed in load_feed_list(feeds_path):
         name = feed["name"]
+        europe_focused = bool(feed.get("europe_focused", False))
         parsed = feedparser.parse(feed["url"])
         for entry in parsed.entries:
             item_id = getattr(entry, "id", None) or getattr(entry, "link", None)
@@ -45,6 +46,9 @@ def fetch_new_items(feeds_path: Path = DEFAULT_FEEDS_PATH) -> list:
             # keep the summary tight, this is a graphic caption not an article
             if len(summary) > 400:
                 summary = summary[:397].rsplit(" ", 1)[0] + "..."
+            tags = ["news"]
+            if europe_focused:
+                tags.append("europe_focused")
             items.append(
                 SourceItem(
                     source=f"rss:{name}",
@@ -53,7 +57,7 @@ def fetch_new_items(feeds_path: Path = DEFAULT_FEEDS_PATH) -> list:
                     summary=summary,
                     url=getattr(entry, "link", ""),
                     published=getattr(entry, "published", ""),
-                    tags=["news"],
+                    tags=tags,
                 )
             )
     return items

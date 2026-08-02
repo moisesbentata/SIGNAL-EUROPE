@@ -1,10 +1,17 @@
 """Official Instagram publishing via the Meta Graph API.
 
-Publishing a photo is a two-step call:
+Publishing a single photo is a two-step call:
   1. POST /{ig_user_id}/media       with image_url + caption -> creation_id
   2. POST /{ig_user_id}/media_publish with creation_id        -> published post
 
-The Graph API requires the image at a public URL (it fetches it
+Publishing a carousel (2-10 images/slides in one post) adds a layer:
+  1. POST /{ig_user_id}/media  per image, with is_carousel_item=true (no
+     caption on the children) -> one creation_id per slide
+  2. POST /{ig_user_id}/media  with media_type=CAROUSEL, children=<ids>,
+     and the caption -> a parent creation_id
+  3. POST /{ig_user_id}/media_publish with the parent creation_id
+
+The Graph API requires each image at a public URL (it fetches it
 server-side) — local files must be uploaded somewhere reachable first,
 see upload_image() below.
 
@@ -24,6 +31,30 @@ GRAPH_API_BASE = "https://graph.facebook.com/v19.0"
 
 class GraphAPIError(RuntimeError):
     pass
+
+
+def _get_credentials():
+    ig_user_id = os.getenv("IG_BUSINESS_ACCOUNT_ID")
+    access_token = os.getenv("IG_ACCESS_TOKEN")
+    if not ig_user_id or not access_token:
+        raise GraphAPIError(
+            "IG_BUSINESS_ACCOUNT_ID / IG_ACCESS_TOKEN are not configured in .env"
+        )
+    return ig_user_id, access_token
+
+
+def _wait_until_finished(creation_id: str, access_token: str) -> None:
+    for _ in range(10):
+        status_resp = requests.get(
+            f"{GRAPH_API_BASE}/{creation_id}",
+            params={"fields": "status_code", "access_token": access_token},
+            timeout=30,
+        )
+        status_code = status_resp.json().get("status_code")
+        if status_code == "FINISHED":
+            return
+        time.sleep(2)
+    raise GraphAPIError(f"media container {creation_id} never finished processing")
 
 
 def upload_image(local_path: str) -> str:
@@ -50,12 +81,7 @@ def upload_image(local_path: str) -> str:
 
 def publish_image(image_url: str, caption: str) -> str:
     """Publishes a single image post. Returns the published media id."""
-    ig_user_id = os.getenv("IG_BUSINESS_ACCOUNT_ID")
-    access_token = os.getenv("IG_ACCESS_TOKEN")
-    if not ig_user_id or not access_token:
-        raise GraphAPIError(
-            "IG_BUSINESS_ACCOUNT_ID / IG_ACCESS_TOKEN are not configured in .env"
-        )
+    ig_user_id, access_token = _get_credentials()
 
     create_resp = requests.post(
         f"{GRAPH_API_BASE}/{ig_user_id}/media",
@@ -70,19 +96,7 @@ def publish_image(image_url: str, caption: str) -> str:
         raise GraphAPIError(f"media creation failed: {create_resp.text}")
     creation_id = create_resp.json()["id"]
 
-    # container processing is async, poll briefly before publishing
-    for _ in range(10):
-        status_resp = requests.get(
-            f"{GRAPH_API_BASE}/{creation_id}",
-            params={"fields": "status_code", "access_token": access_token},
-            timeout=30,
-        )
-        status_code = status_resp.json().get("status_code")
-        if status_code == "FINISHED":
-            break
-        time.sleep(2)
-    else:
-        raise GraphAPIError(f"media container {creation_id} never finished processing")
+    _wait_until_finished(creation_id, access_token)
 
     publish_resp = requests.post(
         f"{GRAPH_API_BASE}/{ig_user_id}/media_publish",
@@ -91,5 +105,58 @@ def publish_image(image_url: str, caption: str) -> str:
     )
     if not publish_resp.ok:
         raise GraphAPIError(f"media publish failed: {publish_resp.text}")
+
+    return publish_resp.json()["id"]
+
+
+def publish_carousel(image_urls: list, caption: str) -> str:
+    """Publishes a multi-slide carousel post (2-10 images). Returns the
+    published media id. image_urls must be public URLs in slide order —
+    upload each local slide with upload_image() first."""
+    if not 2 <= len(image_urls) <= 10:
+        raise GraphAPIError(f"carousel needs 2-10 images, got {len(image_urls)}")
+
+    ig_user_id, access_token = _get_credentials()
+
+    child_ids = []
+    for image_url in image_urls:
+        child_resp = requests.post(
+            f"{GRAPH_API_BASE}/{ig_user_id}/media",
+            data={
+                "image_url": image_url,
+                "is_carousel_item": "true",
+                "access_token": access_token,
+            },
+            timeout=30,
+        )
+        if not child_resp.ok:
+            raise GraphAPIError(f"carousel child creation failed: {child_resp.text}")
+        child_id = child_resp.json()["id"]
+        _wait_until_finished(child_id, access_token)
+        child_ids.append(child_id)
+
+    parent_resp = requests.post(
+        f"{GRAPH_API_BASE}/{ig_user_id}/media",
+        data={
+            "media_type": "CAROUSEL",
+            "children": ",".join(child_ids),
+            "caption": caption,
+            "access_token": access_token,
+        },
+        timeout=30,
+    )
+    if not parent_resp.ok:
+        raise GraphAPIError(f"carousel container creation failed: {parent_resp.text}")
+    parent_id = parent_resp.json()["id"]
+
+    _wait_until_finished(parent_id, access_token)
+
+    publish_resp = requests.post(
+        f"{GRAPH_API_BASE}/{ig_user_id}/media_publish",
+        data={"creation_id": parent_id, "access_token": access_token},
+        timeout=30,
+    )
+    if not publish_resp.ok:
+        raise GraphAPIError(f"carousel publish failed: {publish_resp.text}")
 
     return publish_resp.json()["id"]
