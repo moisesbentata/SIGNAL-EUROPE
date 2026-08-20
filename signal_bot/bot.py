@@ -146,6 +146,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def _publish_and_report(video, caption, message, is_edit: bool = False) -> None:
     try:
+        if video.exceeds_graph_api_limit:
+            size_mb = video.size_bytes / (1024 * 1024)
+            raise graph_api.GraphAPIError(
+                f"downloaded video is {size_mb:.0f}MB, over Instagram's "
+                f"~100MB limit for Reels published via the API — it won't "
+                f"upload. This is the source's actual highest-quality file, "
+                f"there's no smaller version to fall back to without "
+                f"re-encoding (which this bot deliberately doesn't do)."
+            )
         video_url = await asyncio.to_thread(graph_api.upload_video, str(video.local_path))
         media_id = await asyncio.to_thread(graph_api.publish_reel, video_url, caption)
         result_text = f"{caption}\n\n✅ Published (media id {media_id})."

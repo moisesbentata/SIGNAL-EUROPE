@@ -12,7 +12,7 @@ video host --publishes--> Instagram (Graph API, Reels)
 ```
 
 - **Trigger**: message the bot an `instagram.com/p/...` or `instagram.com/reel/...` link on Telegram.
-- **Download**: `signal_bot/downloader.py` uses `yt-dlp` against Instagram's public web interface. This is unofficial and against Instagram's Terms of Service — it works for public posts, can break or get rate-limited without warning, and won't work on private accounts.
+- **Download**: `signal_bot/downloader.py` uses `yt-dlp` against Instagram's public web interface, configured to grab the highest-resolution/highest-bitrate stream available and keep it byte-for-byte (no re-encoding). This is unofficial and against Instagram's Terms of Service — it works for public posts, can break or get rate-limited without warning, and won't work on private accounts. If a post has separate video/audio tracks that need merging, `ffmpeg` must be installed on the host (`apt install ffmpeg` / `brew install ffmpeg`) — the common case (a single progressive Instagram stream) doesn't need it.
 - **Publish**: `signal_bot/graph_api.py` uses Meta's official Instagram Graph API to publish the downloaded video as a Reel — the only sanctioned way to post programmatically to your own account.
 - **Access control**: only Telegram user IDs listed in `TELEGRAM_ALLOWED_USER_IDS` can trigger a post. This isn't optional — without it, anyone who finds the bot's username could post to your Instagram account.
 - **Confirmation**: off by default (`REQUIRE_CONFIRMATION=false`) — the bot posts as soon as you send a link, on the assumption you're the one deciding what's worth reposting before you ever send it. Set it to `true` in `.env` if you'd rather get an inline Yes/No check first.
@@ -79,6 +79,8 @@ Whichever you pick, the `.env` values (bot token, IG credentials, video host) ne
 
 ## Known limitations
 
+- **Quality ceiling**: the bot downloads whatever the highest-quality stream Instagram serves for that post is — it can't exceed the source's actual quality, just avoids throwing any of it away. Instagram itself also re-compresses on upload/playback, so "highest quality we can get" still isn't the original creator's raw export.
+- **Instagram's own size limit**: the Graph API rejects Reels over ~100MB when published via `video_url` (verify current limits at developers.facebook.com — Meta changes these). The bot checks file size after download and fails with a clear message rather than silently re-encoding to shrink it, since re-encoding is exactly the quality loss you asked to avoid. If you hit this often, the fix is a bigger/faster video host or a manual re-encode step you control, not something silent.
 - yt-dlp's Instagram support can break when Instagram changes its site — if downloads start failing, check for a yt-dlp update (`pip install -U yt-dlp`) first.
 - Age-restricted, private, or login-required posts won't download without adding cookie-based auth to `downloader.py` — not implemented here.
 - The in-memory pending-post store (used when `REQUIRE_CONFIRMATION=true`) is lost if the bot restarts before you respond to a confirmation prompt — the downloaded file is orphaned in `downloads/` in that case and needs manual cleanup.

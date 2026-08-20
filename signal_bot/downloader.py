@@ -20,6 +20,12 @@ _IG_URL_RE = re.compile(
     r"^https?://(www\.)?instagram\.com/(p|reel|reels)/[A-Za-z0-9_-]+/?", re.IGNORECASE
 )
 
+# Instagram Graph API's own limit for Reels published via video_url, as of
+# this writing — verify current limits at developers.facebook.com before
+# relying on this. We check against it after downloading so an oversized
+# source file fails loudly instead of silently getting rejected by the API.
+GRAPH_API_MAX_VIDEO_BYTES = 100 * 1024 * 1024  # 100 MB
+
 
 class DownloadError(RuntimeError):
     pass
@@ -31,6 +37,14 @@ class DownloadedVideo:
     caption: str
     owner_username: str
     source_url: str
+
+    @property
+    def size_bytes(self) -> int:
+        return self.local_path.stat().st_size
+
+    @property
+    def exceeds_graph_api_limit(self) -> bool:
+        return self.size_bytes > GRAPH_API_MAX_VIDEO_BYTES
 
 
 def is_instagram_url(text: str) -> bool:
@@ -46,7 +60,14 @@ def download(url: str) -> DownloadedVideo:
 
     ydl_opts = {
         "outtmpl": outtmpl,
-        "format": "mp4/best",
+        # highest-resolution/highest-bitrate stream available, merged to
+        # mp4 if the source has separate video/audio tracks; falls back to
+        # a single best progressive stream (the common case for Instagram)
+        "format": "bestvideo*+bestaudio/best",
+        "format_sort": ["res", "fps", "vbr", "abr"],
+        "merge_output_format": "mp4",
+        # no re-encoding/postprocessing — whatever yt-dlp pulls down is
+        # kept byte-for-byte so nothing degrades quality on the way in
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
