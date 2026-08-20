@@ -1,37 +1,47 @@
-"""Telegram bot: message it an Instagram post/reel link, it downloads the
-video and (after you confirm) posts it to the Signal Europe Instagram
-account via the Graph API.
+"""Telegram bot: message it an Instagram post/reel link, it downloads
+the video, uploads it to your video host once, and adds it to a queue
+that publishes to the Signal Europe Instagram account with min
+MIN_POST_GAP_HOURS between posts and no posts inside quiet hours.
 
 Whitelisted to specific Telegram user IDs (TELEGRAM_ALLOWED_USER_IDS) —
-without that, anyone who finds the bot's username could post to your IG
-account. Posts immediately on link receipt by default (the assumption
-being you vet copyright/fit before ever sending a link) — set
-REQUIRE_CONFIRMATION=true in .env if you want an inline Yes/No check
-before it actually publishes.
+without that, anyone who finds the bot's username could post to your
+IG account.
+
+Also runs a weekly job (Sunday 22:00 in POSTING_TIMEZONE) that picks
+the top-performing posts of the last week by reach and adds them back
+to the queue spread across the coming week. See signal_bot/reposts.py.
+
+Commands:
+  /start      — hello message with current settings
+  /queue      — show all pending items with scheduled times
+  /cancel <id> — remove a pending queue item
+  /next       — jump the next pending item to now (still gated by
+                quiet-hours and the min-gap-since-last-posted rules)
+  /reposts    — trigger the weekly repost picker manually
 """
 
 import asyncio
+import logging
 import os
-import uuid
-from pathlib import Path
+from datetime import datetime, time, timezone
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
-from signal_bot import downloader, graph_api
+from signal_bot import downloader, graph_api, reposts, scheduler
+from signal_bot.queue import QueueStore
 
-# in-memory pending-post store: short token -> DownloadedVideo
-# fine for a single-instance bot; if you ever run multiple workers this
-# needs to move to shared storage (e.g. SQLite, redis)
-_PENDING: dict = {}
+logger = logging.getLogger(__name__)
+
+# how often the tick loop wakes to check for due items
+TICK_INTERVAL_SECONDS = 60
 
 
 def _allowed_user_ids() -> set:
@@ -64,13 +74,103 @@ async def _check_allowed(update: Update) -> bool:
     return True
 
 
+def _fmt_local(dt: datetime) -> str:
+    """Human-friendly timestamp in the configured posting timezone."""
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(os.getenv("POSTING_TIMEZONE", "Europe/Madrid"))
+    return dt.astimezone(tz).strftime("%a %d %b, %H:%M")
+
+
+# --------------------------------------------------------------- commands
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    require_confirmation = os.getenv("REQUIRE_CONFIRMATION", "false").strip().lower() == "true"
-    caveat = "with your confirmation first" if require_confirmation else "immediately, no confirmation step"
+    lo = os.getenv("MIN_POST_GAP_HOURS", "4")
+    hi = os.getenv("MAX_POST_GAP_HOURS", "5")
+    qs = os.getenv("QUIET_HOURS_START", "23")
+    qe = os.getenv("QUIET_HOURS_END", "8")
+    tz = os.getenv("POSTING_TIMEZONE", "Europe/Madrid")
     await update.message.reply_text(
-        f"Send me an Instagram post or reel link and I'll download it and "
-        f"post it to the Signal Europe account ({caveat})."
+        "Send me an Instagram post or reel link and I'll queue it for the Signal Europe account.\n\n"
+        f"Spacing: {lo}–{hi}h between posts\n"
+        f"Quiet hours: {qs}:00–{qe}:00 ({tz})\n\n"
+        "Commands: /queue, /cancel <id>, /next, /reposts"
     )
+
+
+async def queue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_allowed(update):
+        return
+    store: QueueStore = context.application.bot_data["store"]
+    items = store.pending()
+    if not items:
+        await update.message.reply_text("Queue is empty.")
+        return
+
+    lines = ["Pending queue:"]
+    for item in items:
+        tag = " 🔁" if item.is_repost else ""
+        headline = (item.caption.split("\n")[0][:70] + "…") if item.caption else item.source_url
+        lines.append(f"#{item.id}{tag}  {_fmt_local(item.scheduled_at)}  — {headline}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /cancel <id>  (see /queue for ids)")
+        return
+    try:
+        item_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Id must be a number.")
+        return
+    store: QueueStore = context.application.bot_data["store"]
+    if store.cancel(item_id):
+        await update.message.reply_text(f"Cancelled #{item_id}.")
+    else:
+        await update.message.reply_text(
+            f"Couldn't cancel #{item_id} — either not found or already posting/posted."
+        )
+
+
+async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_allowed(update):
+        return
+    store: QueueStore = context.application.bot_data["store"]
+    pending = store.pending()
+    if not pending:
+        await update.message.reply_text("Queue is empty, nothing to bump.")
+        return
+    item = pending[0]
+    store.reschedule(item.id, datetime.now(timezone.utc))
+    await update.message.reply_text(
+        f"Bumped #{item.id} to now — will publish on the next tick, still "
+        "subject to quiet-hours and min-gap rules."
+    )
+
+
+async def reposts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_allowed(update):
+        return
+    store: QueueStore = context.application.bot_data["store"]
+    await update.message.reply_text("Running weekly repost picker…")
+    ids = await asyncio.to_thread(reposts.run_weekly_repost, store)
+    if not ids:
+        await update.message.reply_text(
+            "No qualifying posts to repost (need posts ≥48h old, not "
+            "reposted in the last 30 days, and with reach data available)."
+        )
+        return
+    await update.message.reply_text(
+        f"Queued {len(ids)} repost(s): {', '.join('#' + str(i) for i in ids)}. "
+        "Check /queue for scheduled times."
+    )
+
+
+# --------------------------------------------------------------- link intake
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -85,7 +185,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    status_msg = await update.message.reply_text("Downloading...")
+    store: QueueStore = context.application.bot_data["store"]
+
+    # Dedup: refuse if we've already queued/posted this exact URL. A user
+    # who genuinely wants to repost the same source URL again can wait
+    # for the cooldown to lapse via the weekly picker, or use a
+    # different source URL for the same video.
+    existing = store.find_by_source(text)
+    if existing:
+        if existing.status == "posted":
+            when = _fmt_local(existing.posted_at) if existing.posted_at else "earlier"
+            await update.message.reply_text(
+                f"Already posted this link (as #{existing.id}, {when}). Skipping."
+            )
+        else:
+            await update.message.reply_text(
+                f"Already in the queue as #{existing.id}, scheduled for "
+                f"{_fmt_local(existing.scheduled_at)}. Skipping."
+            )
+        return
+
+    status_msg = await update.message.reply_text("Downloading…")
 
     try:
         video = await asyncio.to_thread(downloader.download, text)
@@ -93,94 +213,140 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await status_msg.edit_text(f"Download failed: {exc}")
         return
 
-    require_confirmation = os.getenv("REQUIRE_CONFIRMATION", "false").strip().lower() == "true"
-    caption = _build_caption(video)
-
-    if not require_confirmation:
-        await status_msg.edit_text("Publishing...")
-        await _publish_and_report(video, caption, status_msg)
+    if video.exceeds_graph_api_limit:
+        size_mb = video.size_bytes / (1024 * 1024)
+        video.local_path.unlink(missing_ok=True)
+        await status_msg.edit_text(
+            f"Video is {size_mb:.0f}MB — over Instagram's ~100MB limit for "
+            "Reels via API. Can't upload without re-encoding, which this "
+            "bot deliberately doesn't do (would lose quality)."
+        )
         return
 
-    token = uuid.uuid4().hex[:16]
-    _PENDING[token] = (video, caption)
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Post it", callback_data=f"post:{token}"),
-                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{token}"),
-            ]
-        ]
+    await status_msg.edit_text("Uploading to video host…")
+    try:
+        video_url = await asyncio.to_thread(graph_api.upload_video, str(video.local_path))
+    except graph_api.GraphAPIError as exc:
+        video.local_path.unlink(missing_ok=True)
+        await status_msg.edit_text(f"Upload failed: {exc}")
+        return
+    finally:
+        # local file no longer needed — the video host has it, and
+        # reposts will reuse the same public URL
+        video.local_path.unlink(missing_ok=True)
+
+    caption = _build_caption(video)
+    scheduled_at = scheduler.compute_enqueue_slot(
+        store.last_scheduled(), datetime.now(timezone.utc)
     )
-    await status_msg.delete()
-    with open(video.local_path, "rb") as f:
-        await update.message.reply_video(
-            video=f,
-            caption=f"{caption}\n\n— Post this to Signal Europe?",
-            reply_markup=keyboard,
+    item_id = store.enqueue(
+        source_url=video.source_url,
+        video_url=video_url,
+        caption=caption,
+        owner_username=video.owner_username,
+        scheduled_at=scheduled_at,
+    )
+    await status_msg.edit_text(
+        f"Queued as #{item_id}, scheduled for {_fmt_local(scheduled_at)}. "
+        "Use /queue to see everything pending, /cancel to remove."
+    )
+
+
+# --------------------------------------------------------------- publishing tick
+
+
+async def _tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs every TICK_INTERVAL_SECONDS. Publishes at most one item per
+    tick — that's enough since the min-gap rule prevents anything else
+    from being due for hours anyway."""
+    store: QueueStore = context.application.bot_data["store"]
+    now = datetime.now(timezone.utc)
+
+    item = store.next_due(now)
+    if item is None:
+        return
+
+    allowed, reason = scheduler.can_publish_now(now, store.last_posted_at())
+    if not allowed:
+        logger.info("tick: holding off — %s", reason)
+        return
+
+    if not store.mark_posting(item.id):
+        # something else already grabbed it (shouldn't happen with our
+        # single-process model, but guards against it)
+        return
+
+    logger.info("tick: publishing queue item #%s", item.id)
+    try:
+        media_id = await asyncio.to_thread(graph_api.publish_reel, item.video_url, item.caption)
+        store.mark_posted(item.id, media_id)
+        logger.info("tick: published #%s -> media_id=%s", item.id, media_id)
+        await _notify_owners(context, f"✅ Published #{item.id} (media {media_id}).")
+    except graph_api.GraphAPIError as exc:
+        store.mark_failed(item.id, str(exc))
+        logger.exception("tick: publish failed for #%s", item.id)
+        await _notify_owners(context, f"❌ Publish failed for #{item.id}: {exc}")
+
+
+async def _weekly_repost_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    store: QueueStore = context.application.bot_data["store"]
+    ids = await asyncio.to_thread(reposts.run_weekly_repost, store)
+    if ids:
+        await _notify_owners(
+            context,
+            f"🔁 Weekly repost picker queued {len(ids)} item(s): "
+            + ", ".join("#" + str(i) for i in ids),
         )
 
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    user_id = update.effective_user.id if update.effective_user else None
-    if user_id not in _allowed_user_ids():
-        await query.answer("Not authorized.", show_alert=True)
-        return
-
-    action, token = query.data.split(":", 1)
-    pending = _PENDING.pop(token, None)
-    if pending is None:
-        await query.answer("This request expired or was already handled.", show_alert=True)
-        return
-
-    video, caption = pending
-
-    if action == "cancel":
-        await query.answer("Cancelled.")
-        await query.edit_message_caption(caption=f"{caption}\n\n❌ Cancelled, not posted.", reply_markup=None)
-        video.local_path.unlink(missing_ok=True)
-        return
-
-    await query.answer("Publishing...")
-    await query.edit_message_caption(caption=f"{caption}\n\n⏳ Publishing...", reply_markup=None)
-    await _publish_and_report(video, caption, query.message, is_edit=True)
+async def _notify_owners(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Fires a message to every whitelisted user — so a fully async
+    publish that happens while nobody's watching still surfaces."""
+    for uid in _allowed_user_ids():
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+        except Exception:  # noqa: BLE001 - one failed DM shouldn't stop the rest
+            logger.exception("failed to notify user %s", uid)
 
 
-async def _publish_and_report(video, caption, message, is_edit: bool = False) -> None:
-    try:
-        if video.exceeds_graph_api_limit:
-            size_mb = video.size_bytes / (1024 * 1024)
-            raise graph_api.GraphAPIError(
-                f"downloaded video is {size_mb:.0f}MB, over Instagram's "
-                f"~100MB limit for Reels published via the API — it won't "
-                f"upload. This is the source's actual highest-quality file, "
-                f"there's no smaller version to fall back to without "
-                f"re-encoding (which this bot deliberately doesn't do)."
-            )
-        video_url = await asyncio.to_thread(graph_api.upload_video, str(video.local_path))
-        media_id = await asyncio.to_thread(graph_api.publish_reel, video_url, caption)
-        result_text = f"{caption}\n\n✅ Published (media id {media_id})."
-    except graph_api.GraphAPIError as exc:
-        result_text = f"{caption}\n\n❌ Publish failed: {exc}"
-    finally:
-        video.local_path.unlink(missing_ok=True)
-
-    if is_edit:
-        await message.edit_caption(caption=result_text)
-    else:
-        await message.edit_text(result_text)
+# --------------------------------------------------------------- app wiring
 
 
 def build_app() -> Application:
     load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in .env")
 
     app = Application.builder().token(token).build()
+    app.bot_data["store"] = QueueStore()
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("queue", queue_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("next", next_cmd))
+    app.add_handler(CommandHandler("reposts", reposts_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    if app.job_queue is None:
+        raise RuntimeError(
+            "python-telegram-bot's job_queue is unavailable — install with "
+            "`pip install \"python-telegram-bot[job-queue]\"` (already in requirements.txt)."
+        )
+
+    app.job_queue.run_repeating(_tick, interval=TICK_INTERVAL_SECONDS, first=10)
+
+    # Weekly repost job: Sunday 22:00 in the configured local timezone.
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(os.getenv("POSTING_TIMEZONE", "Europe/Madrid"))
+    app.job_queue.run_daily(
+        _weekly_repost_tick,
+        time=time(hour=22, minute=0, tzinfo=tz),
+        days=(6,),  # Sunday (Mon=0 ... Sun=6)
+    )
     return app
 
 

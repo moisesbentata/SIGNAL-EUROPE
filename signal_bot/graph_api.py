@@ -61,6 +61,30 @@ def upload_video(local_path: str) -> str:
     return f"{public_base.rstrip('/')}/{filename}"
 
 
+def get_media_reach(ig_media_id: str) -> int:
+    """Fetches reach for a published media item. Returns 0 on any error
+    or if the insight isn't available yet (Instagram usually needs a few
+    hours after publish before reach numbers stabilize)."""
+    _, access_token = _get_credentials()
+    resp = requests.get(
+        f"{GRAPH_API_BASE}/{ig_media_id}/insights",
+        params={"metric": "reach", "access_token": access_token},
+        timeout=30,
+    )
+    if not resp.ok:
+        return 0
+    try:
+        data = resp.json().get("data", [])
+        for row in data:
+            if row.get("name") == "reach":
+                values = row.get("values", [])
+                if values:
+                    return int(values[0].get("value", 0))
+    except (ValueError, TypeError, KeyError):
+        return 0
+    return 0
+
+
 def publish_reel(video_url: str, caption: str) -> str:
     """Publishes a single Reel. Returns the published media id."""
     ig_user_id, access_token = _get_credentials()
