@@ -65,9 +65,11 @@ async def _check_allowed(update: Update) -> bool:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    require_confirmation = os.getenv("REQUIRE_CONFIRMATION", "false").strip().lower() == "true"
+    caveat = "with your confirmation first" if require_confirmation else "immediately, no confirmation step"
     await update.message.reply_text(
-        "Send me an Instagram post or reel link and I'll download it and "
-        "post it to the Signal Europe account (with your confirmation first)."
+        f"Send me an Instagram post or reel link and I'll download it and "
+        f"post it to the Signal Europe account ({caveat})."
     )
 
 
