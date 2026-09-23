@@ -4,17 +4,26 @@ the repost caption.
 
 This works against Instagram's public web interface, same as any other
 unofficial scraping — it's against Instagram's Terms of Service and can
-break or get rate-limited without warning. It only works for posts that
-are actually public; private accounts/posts will fail.
+break or get rate-limited without warning. Instagram increasingly
+requires a logged-in session even for public reels: set IG_COOKIES_B64
+(a base64-encoded cookies.txt exported from a throwaway IG account) and
+the downloader will use it. Without it most downloads will fail with
+"login required".
 """
 
+import base64
+import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import yt_dlp
 
 DOWNLOAD_DIR = Path("downloads")
+
+# Cached decoded cookies file path; populated on first use and reused.
+_COOKIES_TMP_PATH: Path | None = None
 
 _IG_URL_RE = re.compile(
     r"^https?://(www\.)?instagram\.com/(p|reel|reels)/[A-Za-z0-9_-]+/?", re.IGNORECASE
@@ -51,6 +60,27 @@ def is_instagram_url(text: str) -> bool:
     return bool(_IG_URL_RE.match(text.strip()))
 
 
+def _cookies_file_path() -> Path | None:
+    """Materialises IG_COOKIES_B64 to a temp file the first time it's
+    called, and returns its path on subsequent calls. Returns None when
+    the env var isn't set."""
+    global _COOKIES_TMP_PATH
+    encoded = os.getenv("IG_COOKIES_B64")
+    if not encoded:
+        return None
+    if _COOKIES_TMP_PATH and _COOKIES_TMP_PATH.exists():
+        return _COOKIES_TMP_PATH
+    try:
+        raw = base64.b64decode(encoded)
+    except Exception as exc:  # noqa: BLE001
+        raise DownloadError(f"IG_COOKIES_B64 is not valid base64: {exc}") from exc
+    fd, tmp_path = tempfile.mkstemp(prefix="ig_cookies_", suffix=".txt")
+    with os.fdopen(fd, "wb") as f:
+        f.write(raw)
+    _COOKIES_TMP_PATH = Path(tmp_path)
+    return _COOKIES_TMP_PATH
+
+
 def download(url: str) -> DownloadedVideo:
     if not is_instagram_url(url):
         raise DownloadError(f"not a recognized Instagram post/reel URL: {url}")
@@ -72,6 +102,10 @@ def download(url: str) -> DownloadedVideo:
         "no_warnings": True,
         "noplaylist": True,
     }
+
+    cookies_path = _cookies_file_path()
+    if cookies_path:
+        ydl_opts["cookiefile"] = str(cookies_path)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
