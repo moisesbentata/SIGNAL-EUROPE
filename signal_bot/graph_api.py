@@ -114,14 +114,19 @@ def publish_reel(video_url: str, caption: str) -> str:
     for _ in range(VIDEO_POLL_ATTEMPTS):
         status_resp = requests.get(
             f"{GRAPH_API_BASE}/{creation_id}",
-            params={"fields": "status_code", "access_token": access_token},
+            params={"fields": "status_code,status", "access_token": access_token},
             timeout=30,
         )
-        status_code = status_resp.json().get("status_code")
+        payload = status_resp.json()
+        status_code = payload.get("status_code")
+        status_detail = payload.get("status", "")
         if status_code == "FINISHED":
             break
         if status_code == "ERROR":
-            raise GraphAPIError(f"media container {creation_id} failed processing")
+            raise GraphAPIError(
+                f"media container {creation_id} failed processing — "
+                f"status_code=ERROR, detail={status_detail!r}"
+            )
         time.sleep(VIDEO_POLL_INTERVAL_SECONDS)
     else:
         raise GraphAPIError(f"media container {creation_id} never finished processing")
