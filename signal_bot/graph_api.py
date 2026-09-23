@@ -42,23 +42,31 @@ def _get_credentials():
 
 
 def upload_video(local_path: str) -> str:
-    """Uploads a local file to the configured video host and returns its
-    public URL. Requires VIDEO_HOST_UPLOAD_URL / VIDEO_HOST_PUBLIC_BASE_URL
-    to be set to an endpoint you control — swap the body of this function
-    for whatever that host's upload API expects."""
-    upload_url = os.getenv("VIDEO_HOST_UPLOAD_URL")
-    public_base = os.getenv("VIDEO_HOST_PUBLIC_BASE_URL")
-    if not upload_url or not public_base:
+    """Uploads a local video to Cloudinary and returns its public HTTPS
+    URL. Reads credentials from the CLOUDINARY_URL env var (format:
+    cloudinary://<api_key>:<api_secret>@<cloud_name>) — grab that value
+    verbatim from Cloudinary dashboard → Product Environment → API
+    environment variable."""
+    if not os.getenv("CLOUDINARY_URL"):
         raise GraphAPIError(
-            "VIDEO_HOST_UPLOAD_URL / VIDEO_HOST_PUBLIC_BASE_URL are not configured. "
-            "The Graph API needs a public video URL — point these at a video "
-            "host you control before publishing."
+            "CLOUDINARY_URL is not configured. Get it from your Cloudinary "
+            "dashboard and set it as a Railway variable."
         )
-    with open(local_path, "rb") as f:
-        resp = requests.post(upload_url, files={"file": f}, timeout=120)
-    resp.raise_for_status()
-    filename = os.path.basename(local_path)
-    return f"{public_base.rstrip('/')}/{filename}"
+    import cloudinary.uploader  # imported lazily to keep the dep optional
+
+    try:
+        result = cloudinary.uploader.upload_large(
+            local_path,
+            resource_type="video",
+            chunk_size=6_000_000,  # 6 MB chunks, safe for Cloudinary's limit
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise GraphAPIError(f"Cloudinary upload failed: {exc}") from exc
+
+    url = result.get("secure_url")
+    if not url:
+        raise GraphAPIError(f"Cloudinary upload returned no secure_url: {result}")
+    return url
 
 
 def get_media_reach(ig_media_id: str) -> int:
