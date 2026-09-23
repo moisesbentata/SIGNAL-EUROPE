@@ -55,14 +55,45 @@ def _allowed_user_ids() -> set:
     return {int(x.strip()) for x in raw.split(",") if x.strip()}
 
 
-def _build_caption(video: downloader.DownloadedVideo) -> str:
+def _build_caption(video: downloader.DownloadedVideo, custom_hook: str = "") -> str:
+    """Signal Europe's own caption for a reposted reel.
+
+    Deliberately ignores the original poster's caption — those routinely
+    contain CTAs that make no sense on our account ("comment 80 for the
+    link", "double-tap if you agree", etc). If the user provided
+    additional text alongside the link, it becomes the hook. Credits go
+    at the bottom, above the hashtags.
+    """
     parts = []
-    if video.caption:
-        parts.append(video.caption)
-    credit = f"🎬 Original: @{video.owner_username}" if video.owner_username else "🎬 Reposted"
-    parts.append(credit)
-    parts.append("#EuropeanVC #AI #Startups #SignalEurope")
+    if custom_hook:
+        parts.append(custom_hook.strip())
+
+    credit_lines = []
+    if video.owner_username:
+        credit_lines.append(f"🎥 Original: @{video.owner_username}")
+    if credit_lines:
+        parts.append("\n".join(credit_lines))
+
+    parts.append("#SignalEurope #EuropeanVC #AI #Startups #TechEurope")
     return "\n\n".join(parts)
+
+
+# matches an IG post/reel URL embedded anywhere in a message (not just
+# at the very start, so the user can include a custom hook alongside it)
+_IG_URL_IN_TEXT_RE = re.compile(
+    r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels)/[A-Za-z0-9_-]+/?[^\s]*",
+    re.IGNORECASE,
+)
+
+
+def _parse_link_message(text: str) -> tuple:
+    """Extracts (ig_url, custom_hook) from a message. custom_hook is
+    everything else in the message stripped clean; empty if nothing."""
+    m = _IG_URL_IN_TEXT_RE.search(text)
+    if not m:
+        return None, ""
+    hook = (text[: m.start()] + " " + text[m.end():]).strip()
+    return m.group(0), hook
 
 
 async def _check_allowed(update: Update) -> bool:
@@ -99,7 +130,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tz = os.getenv("POSTING_TIMEZONE", "Europe/Madrid")
     await update.message.reply_text(
         "Send me an Instagram post or reel link and I'll queue it for the "
-        "Signal Europe account.\n\n"
+        "Signal Europe account. Add your own hook line before or after the "
+        "link and it becomes the caption — otherwise you get credit + hashtags "
+        "only, and the original poster's caption is *not* copied over.\n\n"
         "Or send a NEWS message like:\n"
         "```\n"
         "NEWS\n"
@@ -108,6 +141,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "https://source-url.example (optional)\n"
         "```\n"
         "…and I'll generate a branded Reel graphic and queue it too.\n\n"
+        "Every queued item comes back to you as a preview (the video + the "
+        "exact caption) so you see what will publish before it goes live.\n\n"
         f"Spacing: {lo}–{hi}h between posts\n"
         f"Quiet hours: {qs}:00–{qe}:00 ({tz})\n\n"
         "Commands: /queue, /cancel <id>, /next, /reposts",
@@ -203,11 +238,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_news_message(update, context, text)
         return
 
-    if not downloader.is_instagram_url(text):
+    url, custom_hook = _parse_link_message(text)
+    if not url:
         await update.message.reply_text(
             "That doesn't look like an Instagram post/reel link. Send a URL like "
-            "https://www.instagram.com/reel/XXXXXXXXX/  — or start your message "
-            "with NEWS to build a branded news Reel from text."
+            "https://www.instagram.com/reel/XXXXXXXXX/ — optionally with your own "
+            "hook line before or after it. Or start with NEWS to build a branded "
+            "news Reel from text."
         )
         return
 
@@ -217,7 +254,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # who genuinely wants to repost the same source URL again can wait
     # for the cooldown to lapse via the weekly picker, or use a
     # different source URL for the same video.
-    existing = store.find_by_source(text)
+    existing = store.find_by_source(url)
     if existing:
         if existing.status == "posted":
             when = _fmt_local(existing.posted_at) if existing.posted_at else "earlier"
@@ -234,7 +271,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status_msg = await update.message.reply_text("Downloading…")
 
     try:
-        video = await asyncio.to_thread(downloader.download, text)
+        video = await asyncio.to_thread(downloader.download, url)
     except downloader.DownloadError as exc:
         await status_msg.edit_text(f"Download failed: {exc}")
         return
@@ -256,12 +293,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         video.local_path.unlink(missing_ok=True)
         await status_msg.edit_text(f"Upload failed: {exc}")
         return
-    finally:
-        # local file no longer needed — the video host has it, and
-        # reposts will reuse the same public URL
-        video.local_path.unlink(missing_ok=True)
 
-    caption = _build_caption(video)
+    caption = _build_caption(video, custom_hook=custom_hook)
     scheduled_at = scheduler.compute_enqueue_slot(
         store.last_scheduled(), datetime.now(timezone.utc)
     )
@@ -272,10 +305,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         owner_username=video.owner_username,
         scheduled_at=scheduled_at,
     )
-    await status_msg.edit_text(
-        f"Queued as #{item_id}, scheduled for {_fmt_local(scheduled_at)}. "
-        "Use /queue to see everything pending, /cancel to remove."
+
+    # Send the video back as a preview so you see exactly what will
+    # publish (both the actual video and the caption). Fall back to a
+    # plain text reply if Telegram rejects the video for any reason.
+    header = (
+        f"Queued as #{item_id}, scheduled for {_fmt_local(scheduled_at)}.\n"
+        f"— Caption preview below —"
     )
+    try:
+        with open(video.local_path, "rb") as f:
+            await update.message.reply_video(video=f, caption=header)
+        await update.message.reply_text(caption)
+        await status_msg.delete()
+    except Exception:  # noqa: BLE001
+        await status_msg.edit_text(f"{header}\n\n{caption}")
+    finally:
+        # local file no longer needed — the video host has it, and
+        # reposts will reuse the same public URL
+        video.local_path.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------- news graphic
