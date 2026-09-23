@@ -23,6 +23,8 @@ Commands:
 import asyncio
 import logging
 import os
+import re
+import uuid
 from datetime import datetime, time, timezone
 
 from dotenv import load_dotenv
@@ -35,8 +37,12 @@ from telegram.ext import (
     filters,
 )
 
-from signal_bot import downloader, graph_api, reposts, scheduler
+from pathlib import Path
+
+from signal_bot import downloader, graph_api, news_graphic, news_video, reposts, scheduler
 from signal_bot.queue import QueueStore
+
+NEWS_ASSETS_DIR = Path("data/news_assets")
 
 logger = logging.getLogger(__name__)
 
@@ -92,10 +98,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     qe = os.getenv("QUIET_HOURS_END", "8")
     tz = os.getenv("POSTING_TIMEZONE", "Europe/Madrid")
     await update.message.reply_text(
-        "Send me an Instagram post or reel link and I'll queue it for the Signal Europe account.\n\n"
+        "Send me an Instagram post or reel link and I'll queue it for the "
+        "Signal Europe account.\n\n"
+        "Or send a NEWS message like:\n"
+        "```\n"
+        "NEWS\n"
+        "Your hook headline here\n"
+        "Longer description of the news.\n"
+        "https://source-url.example (optional)\n"
+        "```\n"
+        "…and I'll generate a branded Reel graphic and queue it too.\n\n"
         f"Spacing: {lo}–{hi}h between posts\n"
         f"Quiet hours: {qs}:00–{qe}:00 ({tz})\n\n"
-        "Commands: /queue, /cancel <id>, /next, /reposts"
+        "Commands: /queue, /cancel <id>, /next, /reposts",
+        parse_mode="Markdown",
     )
 
 
@@ -178,10 +194,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     text = (update.message.text or "").strip()
+
+    # NEWS trigger: message that starts with "NEWS" (case-insensitive)
+    # goes through the branded-graphic pipeline instead of the video
+    # downloader. We check this first so a NEWS message that happens to
+    # contain an IG link isn't misrouted.
+    if re.match(r"^\s*news\b", text, flags=re.IGNORECASE):
+        await handle_news_message(update, context, text)
+        return
+
     if not downloader.is_instagram_url(text):
         await update.message.reply_text(
             "That doesn't look like an Instagram post/reel link. Send a URL like "
-            "https://www.instagram.com/reel/XXXXXXXXX/"
+            "https://www.instagram.com/reel/XXXXXXXXX/  — or start your message "
+            "with NEWS to build a branded news Reel from text."
         )
         return
 
@@ -250,6 +276,107 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Queued as #{item_id}, scheduled for {_fmt_local(scheduled_at)}. "
         "Use /queue to see everything pending, /cancel to remove."
     )
+
+
+# --------------------------------------------------------------- news graphic
+
+
+def _build_news_caption(headline: str, description: str, source_url: str) -> str:
+    parts = [headline]
+    if description:
+        parts.append(description)
+    if source_url:
+        parts.append(f"Source: {source_url}")
+    parts.append("#SignalEurope #EuropeanVC #AI #Startups")
+    return "\n\n".join(parts)
+
+
+async def handle_news_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    headline, description, source_url = news_graphic.parse_news_message(text)
+    if not headline:
+        await update.message.reply_text(
+            "Couldn't find a headline in that NEWS message. Format:\n"
+            "```\nNEWS\n<Headline>\n<Description>\n<url>\n```",
+            parse_mode="Markdown",
+        )
+        return
+
+    store: QueueStore = context.application.bot_data["store"]
+
+    # de-dup on the source URL if one is present; if the news post is
+    # text-only, fall back to a hash-like handle so repeated identical
+    # texts don't stack
+    dedup_key = source_url or f"news:{hash(headline + description) & 0xffffffff:x}"
+    existing = store.find_by_source(dedup_key)
+    if existing and existing.status != "cancelled":
+        if existing.status == "posted":
+            when = _fmt_local(existing.posted_at) if existing.posted_at else "earlier"
+            await update.message.reply_text(f"Already posted this news (as #{existing.id}, {when}). Skipping.")
+        else:
+            await update.message.reply_text(
+                f"Already in the queue as #{existing.id}, scheduled for "
+                f"{_fmt_local(existing.scheduled_at)}. Skipping."
+            )
+        return
+
+    status_msg = await update.message.reply_text("Generating graphic…")
+
+    NEWS_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    slug = uuid.uuid4().hex[:12]
+    png_path = NEWS_ASSETS_DIR / f"news_{slug}.png"
+    mp4_path = NEWS_ASSETS_DIR / f"news_{slug}.mp4"
+
+    try:
+        await asyncio.to_thread(news_graphic.render, headline, description, png_path)
+    except Exception as exc:  # noqa: BLE001
+        await status_msg.edit_text(f"Graphic generation failed: {exc}")
+        return
+
+    await status_msg.edit_text("Rendering to MP4…")
+    try:
+        await asyncio.to_thread(news_video.png_to_reel_mp4, png_path, mp4_path)
+    except news_video.VideoBuildError as exc:
+        png_path.unlink(missing_ok=True)
+        await status_msg.edit_text(f"Video build failed: {exc}")
+        return
+
+    await status_msg.edit_text("Uploading to video host…")
+    try:
+        video_url = await asyncio.to_thread(graph_api.upload_video, str(mp4_path))
+    except graph_api.GraphAPIError as exc:
+        await status_msg.edit_text(f"Upload failed: {exc}")
+        return
+    finally:
+        # keep the png locally as a preview (small, useful for debugging);
+        # drop the mp4 since Cloudinary has it now
+        mp4_path.unlink(missing_ok=True)
+
+    caption = _build_news_caption(headline, description, source_url)
+    scheduled_at = scheduler.compute_enqueue_slot(
+        store.last_scheduled(), datetime.now(timezone.utc)
+    )
+    item_id = store.enqueue(
+        source_url=dedup_key,
+        video_url=video_url,
+        caption=caption,
+        owner_username="",
+        scheduled_at=scheduled_at,
+    )
+
+    # send the preview PNG back to Telegram so you see what will publish
+    try:
+        with open(png_path, "rb") as f:
+            await update.message.reply_photo(
+                photo=f,
+                caption=(
+                    f"Queued as #{item_id}, scheduled for {_fmt_local(scheduled_at)}."
+                ),
+            )
+        await status_msg.delete()
+    except Exception:  # noqa: BLE001 - preview send is best-effort
+        await status_msg.edit_text(
+            f"Queued as #{item_id}, scheduled for {_fmt_local(scheduled_at)}."
+        )
 
 
 # --------------------------------------------------------------- publishing tick
