@@ -61,8 +61,8 @@ _PLATFORM_LABEL = {
 }
 
 
-def _build_caption(video: downloader.DownloadedVideo, custom_hook: str = "") -> str:
-    """Signal Europe's own caption for a reposted video.
+def _build_caption(post: downloader.DownloadedPost, custom_hook: str = "") -> str:
+    """Signal Europe's own caption for a reposted post.
 
     Deliberately ignores the original poster's caption — those routinely
     contain CTAs that make no sense on our account ("comment 80 for the
@@ -75,10 +75,10 @@ def _build_caption(video: downloader.DownloadedVideo, custom_hook: str = "") -> 
     if custom_hook:
         parts.append(custom_hook.strip())
 
-    if video.owner_username:
-        platform_label = _PLATFORM_LABEL.get(video.platform, "")
+    if post.owner_username:
+        platform_label = _PLATFORM_LABEL.get(post.platform, "")
         suffix = f" on {platform_label}" if platform_label else ""
-        parts.append(f"🎥 Original: @{video.owner_username}{suffix}")
+        parts.append(f"🎥 Original: @{post.owner_username}{suffix}")
 
     parts.append("#SignalEurope #EuropeanVC #AI #Startups #TechEurope")
     return "\n\n".join(parts)
@@ -284,59 +284,114 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status_msg = await update.message.reply_text("Downloading…")
 
     try:
-        video = await asyncio.to_thread(downloader.download, url)
+        post = await asyncio.to_thread(downloader.download, url)
     except downloader.DownloadError as exc:
         await status_msg.edit_text(f"Download failed: {exc}")
         return
 
-    if video.exceeds_graph_api_limit:
-        size_mb = video.size_bytes / (1024 * 1024)
-        video.local_path.unlink(missing_ok=True)
+    oversized = post.oversized_items()
+    if oversized:
+        for item in post.items:
+            item.local_path.unlink(missing_ok=True)
+        biggest = max(oversized, key=lambda i: i.size_bytes)
+        size_mb = biggest.size_bytes / (1024 * 1024)
+        limit_mb = (downloader.GRAPH_API_MAX_VIDEO_BYTES if biggest.media_type == "video"
+                    else downloader.GRAPH_API_MAX_IMAGE_BYTES) / (1024 * 1024)
         await status_msg.edit_text(
-            f"Video is {size_mb:.0f}MB — over Instagram's ~100MB limit for "
-            "Reels via API. Can't upload without re-encoding, which this "
-            "bot deliberately doesn't do (would lose quality)."
+            f"One of the {biggest.media_type} items is {size_mb:.0f}MB — over "
+            f"Instagram's ~{limit_mb:.0f}MB limit. Not uploaded."
         )
         return
 
-    await status_msg.edit_text("Uploading to video host…")
+    # Upload each item to Cloudinary, preserving order for carousels.
+    await status_msg.edit_text(
+        f"Uploading {len(post.items)} item{'s' if post.is_carousel else ''}…"
+    )
+    media_items = []
     try:
-        video_url = await asyncio.to_thread(graph_api.upload_video, str(video.local_path))
+        for item in post.items:
+            public_url = await asyncio.to_thread(
+                graph_api.upload_media, str(item.local_path), item.media_type
+            )
+            media_items.append({"url": public_url, "type": item.media_type})
     except graph_api.GraphAPIError as exc:
-        video.local_path.unlink(missing_ok=True)
+        for item in post.items:
+            item.local_path.unlink(missing_ok=True)
         await status_msg.edit_text(f"Upload failed: {exc}")
         return
 
-    caption = _build_caption(video, custom_hook=custom_hook)
+    caption = _build_caption(post, custom_hook=custom_hook)
     scheduled_at = scheduler.compute_enqueue_slot(
         store.last_scheduled(), datetime.now(timezone.utc)
     )
     item_id = store.enqueue(
-        source_url=video.source_url,
-        video_url=video_url,
+        source_url=post.source_url,
+        media_items=media_items,
         caption=caption,
-        owner_username=video.owner_username,
+        owner_username=post.owner_username,
         scheduled_at=scheduled_at,
     )
 
-    # Send the video back as a preview so you see exactly what will
-    # publish (both the actual video and the caption). Fall back to a
-    # plain text reply if Telegram rejects the video for any reason.
+    # Send the media back as a preview — for a single item just that
+    # media, for a carousel a media_group so Telegram displays them in
+    # order. Pass explicit width/height on videos so Telegram doesn't
+    # stretch them to a default aspect ratio (Twitter/X videos are
+    # typically landscape and were showing stretched vertically before).
     header = (
-        f"Queued as #{item_id}, scheduled for {_fmt_local(scheduled_at)}.\n"
-        f"— Caption preview below —"
+        f"Queued as #{item_id} ({post.post_type_hint}), scheduled for "
+        f"{_fmt_local(scheduled_at)}.\n— Caption preview below —"
     )
     try:
-        with open(video.local_path, "rb") as f:
-            await update.message.reply_video(video=f, caption=header)
+        await _send_media_preview(update, post, header)
         await update.message.reply_text(caption)
         await status_msg.delete()
     except Exception:  # noqa: BLE001
         await status_msg.edit_text(f"{header}\n\n{caption}")
     finally:
-        # local file no longer needed — the video host has it, and
-        # reposts will reuse the same public URL
-        video.local_path.unlink(missing_ok=True)
+        for item in post.items:
+            item.local_path.unlink(missing_ok=True)
+
+
+async def _send_media_preview(update: Update, post: downloader.DownloadedPost, header: str) -> None:
+    """Sends the downloaded media back to Telegram so the user sees
+    what will publish. Uses reply_media_group for carousels; passes
+    explicit width/height on videos to preserve aspect ratio."""
+    from telegram import InputMediaPhoto, InputMediaVideo
+
+    if len(post.items) == 1:
+        item = post.items[0]
+        with open(item.local_path, "rb") as f:
+            if item.media_type == "video":
+                kwargs = {"video": f, "caption": header, "supports_streaming": True}
+                if item.width and item.height:
+                    kwargs["width"] = item.width
+                    kwargs["height"] = item.height
+                if item.duration:
+                    kwargs["duration"] = int(item.duration)
+                await update.message.reply_video(**kwargs)
+            else:
+                await update.message.reply_photo(photo=f, caption=header)
+        return
+
+    # carousel — Telegram media groups can mix photos and videos and
+    # cap at 10 items, matching IG's own carousel cap
+    handles = [open(item.local_path, "rb") for item in post.items]
+    try:
+        media_group = []
+        for i, item in enumerate(post.items):
+            caption = header if i == 0 else None
+            if item.media_type == "video":
+                mg_kwargs = {"media": handles[i], "caption": caption, "supports_streaming": True}
+                if item.width and item.height:
+                    mg_kwargs["width"] = item.width
+                    mg_kwargs["height"] = item.height
+                media_group.append(InputMediaVideo(**mg_kwargs))
+            else:
+                media_group.append(InputMediaPhoto(media=handles[i], caption=caption))
+        await update.message.reply_media_group(media=media_group)
+    finally:
+        for h in handles:
+            h.close()
 
 
 # --------------------------------------------------------------- news graphic
@@ -464,9 +519,9 @@ async def _tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         # single-process model, but guards against it)
         return
 
-    logger.info("tick: publishing queue item #%s", item.id)
+    logger.info("tick: publishing queue item #%s (%s)", item.id, item.post_type)
     try:
-        media_id = await asyncio.to_thread(graph_api.publish_reel, item.video_url, item.caption)
+        media_id = await asyncio.to_thread(_publish_item, item)
         store.mark_posted(item.id, media_id)
         logger.info("tick: published #%s -> media_id=%s", item.id, media_id)
         await _notify_owners(context, f"✅ Published #{item.id} (media {media_id}).")
@@ -474,6 +529,25 @@ async def _tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         store.mark_failed(item.id, str(exc))
         logger.exception("tick: publish failed for #%s", item.id)
         await _notify_owners(context, f"❌ Publish failed for #{item.id}: {exc}")
+
+
+def _publish_item(item) -> str:
+    """Routes a queue item to the right Graph API flow based on
+    post_type. Returns the published IG media id."""
+    if item.post_type == "carousel":
+        if not item.media_items:
+            raise graph_api.GraphAPIError(
+                f"queue item #{item.id} is a carousel but has no media_items"
+            )
+        return graph_api.publish_carousel(item.media_items, item.caption)
+    if item.post_type == "photo":
+        image_url = item.media_items[0]["url"] if item.media_items else item.video_url
+        return graph_api.publish_photo(image_url, item.caption)
+    # default = reel (single video)
+    video_url = item.video_url or (item.media_items[0]["url"] if item.media_items else "")
+    if not video_url:
+        raise graph_api.GraphAPIError(f"queue item #{item.id} has no video URL")
+    return graph_api.publish_reel(video_url, item.caption)
 
 
 async def _weekly_repost_tick(context: ContextTypes.DEFAULT_TYPE) -> None:

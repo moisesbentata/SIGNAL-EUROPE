@@ -4,3 +4,4 @@ requests==2.32.3
 python-dotenv==1.0.1
 cloudinary==1.44.0
 Pillow==10.4.0
+anthropic==0.34.2

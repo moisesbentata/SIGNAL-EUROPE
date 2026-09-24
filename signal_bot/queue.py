@@ -7,11 +7,19 @@ for "recent posts by reach" without a join.
 
 Columns:
   id                 auto-increment primary key
-  source_url         original IG post URL — used for dedup
-  video_url          public URL after upload (kept forever so reposts
-                     don't need to re-upload; empty until upload succeeds)
+  source_url         original source URL (or synthetic key for text/media
+                     posts) — used for dedup
+  video_url          legacy single-video URL, kept for backward compat.
+                     New rows leave this empty and use media_items_json.
+  media_items_json   JSON array of {"url": ..., "type": "image"|"video"}
+                     in slide order. Single-video posts use a 1-element
+                     list; carousels use 2-10. When both this and
+                     video_url are set, media_items_json wins.
+  post_type          "reel" | "photo" | "carousel" — publisher uses this
+                     to pick the Graph API flow.
   caption            caption text to publish with
-  owner_username     original creator, for the credit line
+  owner_username     original creator, for the credit line (empty for
+                     posts the user authored themselves)
   scheduled_at       ISO UTC timestamp for planned publish time
   is_repost          0/1
   original_queue_id  nullable — for reposts, the queue id of the source
@@ -23,9 +31,10 @@ Columns:
   created_at         ISO UTC insert time
 """
 
+import json
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -46,6 +55,8 @@ class QueueItem:
     id: int
     source_url: str
     video_url: str
+    media_items: list  # list[{"url": str, "type": "image"|"video"}]
+    post_type: str  # "reel" | "photo" | "carousel"
     caption: str
     owner_username: str
     scheduled_at: datetime
@@ -58,16 +69,47 @@ class QueueItem:
     created_at: datetime
 
 
+def _row_col(row: sqlite3.Row, name: str, default=None):
+    """Row.__getitem__ raises IndexError for missing cols on some
+    SQLite builds; this treats missing as default so we tolerate rows
+    created before newer columns were added (in case the persistent DB
+    doesn't have them yet)."""
+    try:
+        val = row[name]
+    except (IndexError, KeyError):
+        return default
+    return val if val is not None else default
+
+
 def _row_to_item(row: sqlite3.Row) -> QueueItem:
     def _parse(ts: Optional[str]) -> Optional[datetime]:
         if not ts:
             return None
         return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
 
+    media_items_json = _row_col(row, "media_items_json")
+    if media_items_json:
+        try:
+            media_items = json.loads(media_items_json)
+        except (ValueError, TypeError):
+            media_items = []
+    else:
+        # legacy row with only video_url populated
+        legacy_video = row["video_url"] or ""
+        media_items = [{"url": legacy_video, "type": "video"}] if legacy_video else []
+
+    post_type = _row_col(row, "post_type") or (
+        "carousel" if len(media_items) > 1
+        else "photo" if (media_items and media_items[0]["type"] == "image")
+        else "reel"
+    )
+
     return QueueItem(
         id=row["id"],
         source_url=row["source_url"],
         video_url=row["video_url"] or "",
+        media_items=media_items,
+        post_type=post_type,
         caption=row["caption"] or "",
         owner_username=row["owner_username"] or "",
         scheduled_at=_parse(row["scheduled_at"]),
@@ -92,6 +134,8 @@ class QueueStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     source_url TEXT NOT NULL,
                     video_url TEXT,
+                    media_items_json TEXT,
+                    post_type TEXT,
                     caption TEXT,
                     owner_username TEXT,
                     scheduled_at TEXT NOT NULL,
@@ -105,6 +149,17 @@ class QueueStore:
                 )
                 """
             )
+            # Additive migrations for existing databases created before
+            # these columns existed. SQLite has no IF NOT EXISTS on ADD
+            # COLUMN, so we probe pragma_table_info instead.
+            existing_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(queue)").fetchall()
+            }
+            if "media_items_json" not in existing_cols:
+                conn.execute("ALTER TABLE queue ADD COLUMN media_items_json TEXT")
+            if "post_type" not in existing_cols:
+                conn.execute("ALTER TABLE queue ADD COLUMN post_type TEXT")
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_source ON queue(source_url)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_posted_at ON queue(posted_at)")
@@ -138,23 +193,52 @@ class QueueStore:
     def enqueue(
         self,
         source_url: str,
-        video_url: str,
         caption: str,
         owner_username: str,
         scheduled_at: datetime,
+        media_items: Optional[list] = None,
+        post_type: Optional[str] = None,
+        video_url: str = "",
         is_repost: bool = False,
         original_queue_id: Optional[int] = None,
     ) -> int:
+        """Enqueue a post.
+
+        Preferred: pass media_items (list of {"url", "type"}) + post_type
+        ("reel" | "photo" | "carousel"). Legacy callers may still pass
+        video_url instead; it's stored on the row and _row_to_item
+        upgrades it back into a 1-element media_items list on read.
+        """
+        if media_items:
+            media_items_json = json.dumps(media_items)
+            if not post_type:
+                post_type = (
+                    "carousel" if len(media_items) > 1
+                    else "photo" if media_items[0]["type"] == "image"
+                    else "reel"
+                )
+            # keep video_url populated for the single-video case so any
+            # legacy path that reads it still works
+            if not video_url and post_type == "reel":
+                video_url = media_items[0]["url"]
+        else:
+            media_items_json = None
+            if not post_type:
+                post_type = "reel"
+
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO queue (source_url, video_url, caption, owner_username,
+                INSERT INTO queue (source_url, video_url, media_items_json,
+                                    post_type, caption, owner_username,
                                     scheduled_at, is_repost, original_queue_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     source_url,
                     video_url,
+                    media_items_json,
+                    post_type,
                     caption,
                     owner_username,
                     scheduled_at.astimezone(timezone.utc).isoformat(),
