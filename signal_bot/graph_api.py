@@ -68,11 +68,39 @@ def upload_media(local_path: str, media_type: str = "video") -> str:
     import cloudinary.uploader  # imported lazily to keep the dep optional
 
     try:
-        # upload_large chunks big files (needed for video); works fine for
-        # images too, just chunks less often
+        if media_type == "image":
+            # Convert to JPEG and pad to a 1080x1080 square AT UPLOAD TIME
+            # (eager transformation), then serve the resulting derived
+            # asset's URL. This avoids on-the-fly URL transformations —
+            # Instagram's media fetcher fails on those (returns "could not
+            # retrieve media from URI"), whether because of the commas in
+            # the path or Cloudinary strict-transform settings. A
+            # pre-generated eager asset is delivered like any plain upload.
+            result = cloudinary.uploader.upload(
+                local_path,
+                resource_type="image",
+                format="jpg",
+                eager=[{
+                    "width": 1080,
+                    "height": 1080,
+                    "crop": "pad",
+                    "background": "auto",
+                }],
+                eager_async=False,
+            )
+            eager = result.get("eager") or []
+            if eager and eager[0].get("secure_url"):
+                return eager[0]["secure_url"]
+            # fall back to the base (already JPEG) if eager didn't come back
+            url = result.get("secure_url")
+            if not url:
+                raise GraphAPIError(f"Cloudinary upload returned no url: {result}")
+            return url
+
+        # video: chunked upload, served as-is (Reels accept the native file)
         result = cloudinary.uploader.upload_large(
             local_path,
-            resource_type=media_type,
+            resource_type="video",
             chunk_size=6_000_000,  # 6 MB chunks, safe for Cloudinary's limit
         )
     except Exception as exc:  # noqa: BLE001
@@ -131,25 +159,12 @@ def get_media_reach(ig_media_id: str) -> int:
 
 
 def _as_jpeg_url(cloudinary_url: str) -> str:
-    """Inserts a Cloudinary transformation chain so the URL delivers
-    an IG-compatible image regardless of the original's format or
-    aspect ratio:
-
-      - f_jpg : force JPEG output (IG IMAGE endpoints require JPEG)
-      - q_auto : auto quality
-      - c_pad,ar_1:1,b_blurred : pad to a square with a blurred
-        version of the same image as background. Instagram carousels
-        accept 4:5..1.91:1 — forcing 1:1 handles tall screenshots
-        (tweets, mobile shots) and wide landscapes uniformly, so
-        nothing gets rejected as "URI does not meet our requirements".
-        b_blurred works on Cloudinary's free tier and looks better
-        than a solid bar.
-    """
-    return cloudinary_url.replace(
-        "/image/upload/",
-        "/image/upload/f_jpg,q_auto,c_pad,ar_1:1,b_blurred:400:15/",
-        1,
-    )
+    """No-op passthrough. Images are now converted to JPEG and padded to
+    a square at UPLOAD time (see upload_media's eager transformation), so
+    the URL we're handed is already IG-ready and must NOT be mangled with
+    on-the-fly transformation params — Instagram's fetcher chokes on
+    those. Kept as a function so call sites don't need to change."""
+    return cloudinary_url
 
 
 def _wait_finished(creation_id: str, access_token: str) -> None:

@@ -135,6 +135,15 @@ def detect_platform(url: str) -> str:
     raise DownloadError(f"unrecognised URL (need Instagram or Twitter/X): {url}")
 
 
+def _scraper_proxy() -> str:
+    """Optional residential/rotating proxy for the download requests.
+    Instagram and Twitter aggressively block datacenter IPs (Railway,
+    AWS, etc), so when the bot runs in the cloud a residential proxy is
+    usually the only way downloads succeed reliably. Set SCRAPER_PROXY
+    to a full proxy URL (http://user:pass@host:port). Empty = direct."""
+    return os.getenv("SCRAPER_PROXY", "").strip()
+
+
 def _cookies_file_path(platform: str) -> Path | None:
     env_name = _COOKIE_ENV.get(platform)
     if not env_name:
@@ -251,8 +260,10 @@ def _download_image_via_requests(image_url: str, entry_id: str) -> Path | None:
     """Fallback when yt-dlp couldn't materialise an image entry. Fetches
     the URL directly and saves under DOWNLOAD_DIR."""
     import requests
+    proxy = _scraper_proxy()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
-        resp = requests.get(image_url, timeout=30, stream=True)
+        resp = requests.get(image_url, timeout=30, stream=True, proxies=proxies)
         resp.raise_for_status()
     except Exception:  # noqa: BLE001
         return None
@@ -317,13 +328,25 @@ def download(url: str) -> DownloadedPost:
     if cookies_path:
         ydl_opts["cookiefile"] = str(cookies_path)
 
+    proxy = _scraper_proxy()
+    if proxy:
+        ydl_opts["proxy"] = proxy
+
     # Two-phase: first extract info without downloading so we can
     # decide per-entry how to fetch it (yt-dlp for videos, requests
     # for image-only entries).
+    #
+    # We run the info pass WITHOUT ignoreerrors so yt-dlp's real failure
+    # reason propagates (login required vs rate-limited vs IP blocked) —
+    # otherwise ignoreerrors swallows it and returns None, and the user
+    # only ever sees the instaloader error. The per-entry download pass
+    # below keeps ignoreerrors so one bad carousel slide doesn't sink
+    # the rest.
     yt_dlp_error: Exception | None = None
     info = None
+    diag_opts = {**ydl_opts, "skip_download": True, "ignoreerrors": False}
     try:
-        with yt_dlp.YoutubeDL({**ydl_opts, "skip_download": True}) as ydl:
+        with yt_dlp.YoutubeDL(diag_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:  # noqa: BLE001
         yt_dlp_error = exc
@@ -493,6 +516,10 @@ def _apply_instaloader_session(L) -> None:
     for name, value in all_cookies.items():
         L.context._session.cookies.set(name, value, domain=".instagram.com")
 
+    proxy = _scraper_proxy()
+    if proxy:
+        L.context._session.proxies.update({"http": proxy, "https": proxy})
+
     L.context._session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -510,8 +537,10 @@ def _download_binary(url: str, entry_id: str, ext: str = "mp4") -> Path | None:
     """Same shape as _download_image_via_requests but explicit ext,
     used for video URLs pulled out of instaloader."""
     import requests
+    proxy = _scraper_proxy()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
-        resp = requests.get(url, timeout=60, stream=True)
+        resp = requests.get(url, timeout=60, stream=True, proxies=proxies)
         resp.raise_for_status()
     except Exception:  # noqa: BLE001
         return None

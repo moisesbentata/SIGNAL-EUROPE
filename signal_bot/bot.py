@@ -1,7 +1,7 @@
 """Telegram bot: message it an Instagram post/reel link, it downloads
 the video, uploads it to your video host once, and adds it to a queue
 that publishes to the Signal Europe Instagram account with min
-MIN_POST_GAP_HOURS between posts and no posts inside quiet hours.
+MIN_POST_GAP_HOURS between posts.
 
 Whitelisted to specific Telegram user IDs (TELEGRAM_ALLOWED_USER_IDS) —
 without that, anyone who finds the bot's username could post to your
@@ -16,7 +16,7 @@ Commands:
   /queue      — show all pending items with scheduled times
   /cancel <id> — remove a pending queue item
   /next       — jump the next pending item to now (still gated by
-                quiet-hours and the min-gap-since-last-posted rules)
+                the min-gap-since-last-posted rule)
   /reposts    — trigger the weekly repost picker manually
 """
 
@@ -164,9 +164,6 @@ def _fmt_local(dt: datetime) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lo = os.getenv("MIN_POST_GAP_HOURS", "4")
     hi = os.getenv("MAX_POST_GAP_HOURS", "5")
-    qs = os.getenv("QUIET_HOURS_START", "23")
-    qe = os.getenv("QUIET_HOURS_END", "8")
-    tz = os.getenv("POSTING_TIMEZONE", "Europe/Madrid")
     await update.message.reply_text(
         "Send me an Instagram or Twitter/X video link and I'll queue it "
         "for the Signal Europe account. Add your own hook line before or "
@@ -183,8 +180,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "…and I'll generate a branded Reel graphic and queue it too.\n\n"
         "Every queued item comes back to you as a preview (the video + the "
         "exact caption) so you see what will publish before it goes live.\n\n"
-        f"Spacing: {lo}–{hi}h between posts\n"
-        f"Quiet hours: {qs}:00–{qe}:00 ({tz})\n\n"
+        f"Spacing: {lo}–{hi}h between posts\n\n"
         "Commands: /queue, /cancel <id>, /next, /reposts",
         parse_mode="Markdown",
     )
@@ -239,7 +235,7 @@ async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     store.reschedule(item.id, datetime.now(timezone.utc))
     await update.message.reply_text(
         f"Bumped #{item.id} to now — will publish on the next tick, still "
-        "subject to quiet-hours and min-gap rules."
+        "subject to the min-gap-since-last-post rule."
     )
 
 

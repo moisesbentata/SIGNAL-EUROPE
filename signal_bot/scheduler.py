@@ -46,16 +46,11 @@ def _gap_range() -> tuple:
 
 
 def is_quiet_hour(dt: datetime) -> bool:
-    """dt is expected to be tz-aware in any zone — converted to POSTING_TIMEZONE."""
-    local = dt.astimezone(_tz())
-    start, end = _quiet_window()
-    if start == end:
-        return False  # no quiet window configured
-    hour = local.hour
-    if start < end:
-        return start <= hour < end
-    # wraps midnight: e.g. 23..8 means hours >= 23 OR hours < 8
-    return hour >= start or hour < end
+    """Quiet hours were removed — posts can go out at any time of day.
+    Kept as a no-op returning False so the scheduling call sites don't
+    need to change. (Re-enable by restoring the window logic here if you
+    ever want it back.)"""
+    return False
 
 
 def _shift_out_of_quiet(dt: datetime) -> datetime:
