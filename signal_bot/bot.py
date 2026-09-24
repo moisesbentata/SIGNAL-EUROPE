@@ -257,6 +257,68 @@ async def reposts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/diag <url> — runs the download + upload pipeline step by step
+    WITHOUT publishing, and reports what happened at each stage. Lets us
+    debug download/upload failures without burning a real post."""
+    if not await _check_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /diag <instagram-or-twitter-url>")
+        return
+
+    url = context.args[0]
+    lines = [f"🔎 Diag for: {url}", ""]
+
+    # env presence (never prints secret values, just whether they're set)
+    def _set(name):
+        return "✅" if os.getenv(name) else "—"
+    lines.append("Env:")
+    lines.append(f"  IG_COOKIES_B64 {_set('IG_COOKIES_B64')}  IG_USERNAME {_set('IG_USERNAME')}")
+    lines.append(f"  TWITTER_COOKIES_B64 {_set('TWITTER_COOKIES_B64')}  SCRAPER_PROXY {_set('SCRAPER_PROXY')}")
+    lines.append(f"  CLOUDINARY_URL {_set('CLOUDINARY_URL')}  GEMINI_API_KEY {_set('GEMINI_API_KEY')}")
+    lines.append(f"  IG_ACCESS_TOKEN {_set('IG_ACCESS_TOKEN')}  IG_BUSINESS_ACCOUNT_ID {_set('IG_BUSINESS_ACCOUNT_ID')}")
+    lines.append("")
+
+    status = await update.message.reply_text("\n".join(lines) + "\n⏳ downloading…")
+
+    # 1) download
+    try:
+        post = await asyncio.to_thread(downloader.download, url)
+    except downloader.DownloadError as exc:
+        lines.append(f"❌ download: {exc}")
+        await status.edit_text("\n".join(lines))
+        return
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"❌ download crashed: {type(exc).__name__}: {exc}")
+        await status.edit_text("\n".join(lines))
+        return
+
+    lines.append(f"✅ download: {len(post.items)} item(s) — {post.post_type_hint}")
+    lines.append(f"   owner=@{post.owner_username or '?'}  platform={post.platform}")
+    for i, it in enumerate(post.items):
+        mb = it.size_bytes / (1024 * 1024)
+        lines.append(f"   [{i+1}] {it.media_type} {it.width}x{it.height} {mb:.1f}MB")
+    await status.edit_text("\n".join(lines) + "\n⏳ uploading first item to Cloudinary…")
+
+    # 2) upload just the first item, report the resulting URL
+    try:
+        first = post.items[0]
+        cdn_url = await asyncio.to_thread(
+            graph_api.upload_media, str(first.local_path), first.media_type
+        )
+        lines.append(f"✅ cloudinary: {cdn_url}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"❌ cloudinary: {type(exc).__name__}: {exc}")
+    finally:
+        for it in post.items:
+            it.local_path.unlink(missing_ok=True)
+
+    lines.append("")
+    lines.append("(nothing was published — this is a dry run)")
+    await status.edit_text("\n".join(lines))
+
+
 # --------------------------------------------------------------- link intake
 
 
@@ -619,6 +681,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("next", next_cmd))
     app.add_handler(CommandHandler("reposts", reposts_cmd))
+    app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     if app.job_queue is None:
