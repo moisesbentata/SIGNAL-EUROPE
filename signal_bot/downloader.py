@@ -460,14 +460,24 @@ def _fetch_via_instaloader(url: str) -> DownloadedPost | None:
 
 
 def _apply_instaloader_session(L) -> None:
-    """Feeds instaloader the sessionid cookie from IG_COOKIES_B64 so
-    it can bypass IG's login wall the same way yt-dlp does. Parses the
-    Netscape cookies.txt format for the sessionid + ds_user_id pair."""
+    """Feeds instaloader the throwaway IG session so it can hit
+    authenticated endpoints. Two things are required:
+
+      1. All cookies from IG_COOKIES_B64 (sessionid, ds_user_id,
+         csrftoken, mid, etc — Instagram's server rejects requests
+         missing any of these).
+      2. A username — instaloader's `is_logged_in` check gates the
+         authenticated request path on this. Take from IG_USERNAME
+         env var; without it we fall back to a placeholder derived
+         from ds_user_id so is_logged_in flips true and the
+         graphql/query endpoint responds instead of redirecting to
+         the login page.
+    """
     cookies_path = _cookies_file_path("instagram")
     if not cookies_path or not cookies_path.exists():
         return
-    session_id = None
-    user_id = None
+
+    all_cookies: dict = {}
     for line in cookies_path.read_text().splitlines():
         if line.startswith("#") or not line.strip():
             continue
@@ -475,20 +485,25 @@ def _apply_instaloader_session(L) -> None:
         if len(parts) < 7:
             continue
         name, value = parts[5], parts[6]
-        if name == "sessionid":
-            session_id = value
-        elif name == "ds_user_id":
-            user_id = value
-    if not session_id:
+        all_cookies[name] = value
+
+    if "sessionid" not in all_cookies:
         return
-    # instaloader lets us seed its requests session directly with the
-    # cookies IG expects
-    L.context._session.cookies.set("sessionid", session_id, domain=".instagram.com")
-    if user_id:
-        L.context._session.cookies.set("ds_user_id", user_id, domain=".instagram.com")
-    # instaloader's context also stores the username for API calls;
-    # deriving it from the session is optional — leave it blank
-    L.context.username = None
+
+    for name, value in all_cookies.items():
+        L.context._session.cookies.set(name, value, domain=".instagram.com")
+
+    L.context._session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "X-IG-App-ID": "936619743392459",  # IG web app id — required by graphql
+        "X-Requested-With": "XMLHttpRequest",
+    })
+
+    username = os.getenv("IG_USERNAME") or all_cookies.get("ds_user_id") or "signal_scraper"
+    L.context.username = username
 
 
 def _download_binary(url: str, entry_id: str, ext: str = "mp4") -> Path | None:
