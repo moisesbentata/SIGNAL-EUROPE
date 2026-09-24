@@ -18,6 +18,8 @@ Commands:
   /next       — jump the next pending item to now (still gated by
                 the min-gap-since-last-posted rule)
   /reposts    — trigger the weekly repost picker manually
+  /format <link> — repost a link stamped with the Signal Europe
+                watermark, preserving the post's original shape
 """
 
 import asyncio
@@ -47,6 +49,7 @@ from signal_bot import (
     news_video,
     reposts,
     scheduler,
+    watermark,
 )
 from signal_bot.queue import QueueStore
 
@@ -179,10 +182,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "https://source-url.example (optional)\n"
         "```\n"
         "…and I'll generate a branded Reel graphic and queue it too.\n\n"
+        "Or `/format <link>` to repost a post stamped with our watermark, "
+        "keeping its original shape (carousel/reel/photo) and order.\n\n"
         "Every queued item comes back to you as a preview (the video + the "
         "exact caption) so you see what will publish before it goes live.\n\n"
         f"Spacing: {lo}–{hi}h between posts\n\n"
-        "Commands: /queue, /cancel <id>, /next, /reposts",
+        "Commands: /queue, /cancel <id>, /next, /reposts, /format <link>",
         parse_mode="Markdown",
     )
 
@@ -344,10 +349,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "• Instagram: https://www.instagram.com/reel/XXXXXXXXX/\n"
             "• Twitter/X: https://x.com/user/status/1234567890\n\n"
             "Optionally add your own hook line before or after the URL. Or "
-            "start with NEWS to build a branded news Reel from text."
+            "start with NEWS to build a branded news Reel from text, or "
+            "/format <link> to repost it stamped with our watermark."
         )
         return
 
+    await _ingest_link(update, context, url, custom_hook, apply_watermark=False)
+
+
+async def format_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/format <link> [optional hook] — same as sending a link, but every
+    downloaded item is stamped with the Signal Europe watermark before it
+    goes out, so the post reads as our own content. Post shape (carousel/
+    reel/photo) and slide order are preserved."""
+    if not await _check_allowed(update):
+        return
+
+    text = (update.message.text or "").strip()
+    # strip the leading "/format" (and any @botname) so the rest parses
+    # like a normal link message
+    text = re.sub(r"^/\w+(@\w+)?\s*", "", text)
+
+    url, custom_hook = _parse_link_message(text)
+    if not url:
+        await update.message.reply_text(
+            "Usage: /format <link> [optional hook]\n\n"
+            "Give me an Instagram or Twitter/X link and I'll repost the "
+            "content stamped with our watermark, keeping its original "
+            "shape (carousel stays a carousel, video stays a video)."
+        )
+        return
+
+    await _ingest_link(update, context, url, custom_hook, apply_watermark=True)
+
+
+async def _ingest_link(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    custom_hook: str,
+    apply_watermark: bool,
+) -> None:
+    """Shared pipeline for a supported link: dedup, download, (optionally
+    watermark), upload each item to Cloudinary, enqueue preserving the
+    source post's shape, and send a preview back to Telegram."""
     store: QueueStore = context.application.bot_data["store"]
 
     # Dedup: refuse if we've already queued/posted this exact URL. A user
@@ -390,6 +435,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    # Stamp our watermark onto each item (for /format). Done before the
+    # upload so Cloudinary/IG and the Telegram preview all get the branded
+    # version. Replaces each item's local_path with the branded file.
+    if apply_watermark:
+        await status_msg.edit_text("Adding watermark…")
+        try:
+            for item in post.items:
+                branded = await asyncio.to_thread(watermark.apply, item)
+                item.local_path.unlink(missing_ok=True)
+                item.local_path = branded
+        except watermark.WatermarkError as exc:
+            for item in post.items:
+                item.local_path.unlink(missing_ok=True)
+            await status_msg.edit_text(f"Watermarking failed: {exc}")
+            return
+
     # Upload each item to Cloudinary, preserving order for carousels.
     await status_msg.edit_text(
         f"Uploading {len(post.items)} item{'s' if post.is_carousel else ''}…"
@@ -424,9 +485,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # order. Pass explicit width/height on videos so Telegram doesn't
     # stretch them to a default aspect ratio (Twitter/X videos are
     # typically landscape and were showing stretched vertically before).
+    wm_note = " · watermarked" if apply_watermark else ""
     header = (
-        f"Queued as #{item_id} ({post.post_type_hint}), scheduled for "
-        f"{_fmt_local(scheduled_at)}.\n— Caption preview below —"
+        f"Queued as #{item_id} ({post.post_type_hint}{wm_note}), scheduled "
+        f"for {_fmt_local(scheduled_at)}.\n— Caption preview below —"
     )
     try:
         await _send_media_preview(update, post, header)
@@ -682,6 +744,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("next", next_cmd))
     app.add_handler(CommandHandler("reposts", reposts_cmd))
+    app.add_handler(CommandHandler("format", format_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
