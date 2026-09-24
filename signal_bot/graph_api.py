@@ -131,10 +131,25 @@ def get_media_reach(ig_media_id: str) -> int:
 
 
 def _as_jpeg_url(cloudinary_url: str) -> str:
-    """Inserts a Cloudinary f_jpg,q_auto transformation so the fetched
-    image is a JPEG regardless of the original upload format. Graph
-    API's IMAGE endpoints require JPEG specifically."""
-    return cloudinary_url.replace("/image/upload/", "/image/upload/f_jpg,q_auto/", 1)
+    """Inserts a Cloudinary transformation chain so the URL delivers
+    an IG-compatible image regardless of the original's format or
+    aspect ratio:
+
+      - f_jpg : force JPEG output (IG IMAGE endpoints require JPEG)
+      - q_auto : auto quality
+      - c_pad,ar_1:1,b_blurred : pad to a square with a blurred
+        version of the same image as background. Instagram carousels
+        accept 4:5..1.91:1 — forcing 1:1 handles tall screenshots
+        (tweets, mobile shots) and wide landscapes uniformly, so
+        nothing gets rejected as "URI does not meet our requirements".
+        b_blurred works on Cloudinary's free tier and looks better
+        than a solid bar.
+    """
+    return cloudinary_url.replace(
+        "/image/upload/",
+        "/image/upload/f_jpg,q_auto,c_pad,ar_1:1,b_blurred:400:15/",
+        1,
+    )
 
 
 def _wait_finished(creation_id: str, access_token: str) -> None:

@@ -1,16 +1,16 @@
 """LLM-generated captions for reposted media.
 
-Sends the downloaded media to Anthropic's Claude vision API with a
-Signal Europe-flavoured prompt and returns a caption with a punchy
-hook line, a short context sentence tied to Europe when the content
-allows, and a question at the end to encourage comments.
+Sends the downloaded media to Google's Gemini vision API and returns a
+caption with a punchy hook line, an optional Europe-angle context
+sentence, and a comment-farm question. Uses gemini-2.0-flash by
+default, which is on Google's free tier (1500 requests/day).
 
-Requires ANTHROPIC_API_KEY. If it's not set, generate_caption() returns
-an empty string and the caller falls back to a plain credit + hashtags
-caption — the pipeline never fails on a missing API key.
+Requires GEMINI_API_KEY (get one free at aistudio.google.com/apikey).
+If it's not set, generate_caption() returns an empty string and the
+caller falls back to a plain credit + hashtags caption — the pipeline
+never fails on a missing API key.
 """
 
-import base64
 import logging
 import mimetypes
 import os
@@ -21,8 +21,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-sonnet-5"
-MAX_INLINE_MEDIA_BYTES = 5 * 1024 * 1024  # 5MB per attachment to keep API happy
+DEFAULT_MODEL = "gemini-2.0-flash"
+MAX_INLINE_MEDIA_BYTES = 5 * 1024 * 1024  # 5MB per attachment
 MAX_ATTACHMENTS = 6  # cap so multi-slide carousels don't blow the context
 
 _SYSTEM_PROMPT = (
@@ -59,7 +59,11 @@ class CaptionGenerationError(RuntimeError):
 
 
 def _is_configured() -> bool:
-    return bool(os.getenv("ANTHROPIC_API_KEY"))
+    return bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+
+
+def _api_key() -> str:
+    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
 
 
 def _extract_video_thumbnail(video_path: Path) -> Path | None:
@@ -89,11 +93,11 @@ def _extract_video_thumbnail(video_path: Path) -> Path | None:
     return out if out.exists() and out.stat().st_size > 0 else None
 
 
-def _encode_media(paths: list) -> tuple:
-    """Turns local file paths into Anthropic vision content blocks.
-    For videos, grabs a thumbnail via ffmpeg. Returns (blocks, temp_paths)
-    so the caller can clean up any extracted thumbnails when done."""
-    blocks: list = []
+def _collect_image_bytes(paths: list) -> tuple:
+    """Loads image bytes (and mime type) for each usable path. Videos
+    get a thumbnail extracted via ffmpeg first. Returns
+    ([(bytes, mime), ...], [temp_paths_to_cleanup])."""
+    entries: list = []
     temp_paths: list = []
     for path in paths[:MAX_ATTACHMENTS]:
         p = Path(path)
@@ -113,68 +117,76 @@ def _encode_media(paths: list) -> tuple:
             logger.info("caption_generator: skipping %s (%.1fMB > 5MB cap)",
                         p.name, p.stat().st_size / 1024 / 1024)
             continue
-        data = base64.b64encode(p.read_bytes()).decode("ascii")
-        blocks.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": mime, "data": data},
-        })
-    return blocks, temp_paths
+        entries.append((p.read_bytes(), mime))
+    return entries, temp_paths
 
 
 def _fallback_caption(_num_media: int) -> str:
-    """Called when the LLM can't produce anything (no API key, network
-    failure, no visual content). Returns an empty string so the caller
-    falls back to credit + hashtags only, rather than injecting a
-    generic template that would feel canned."""
+    """Called when the LLM can't produce anything. Returns empty string
+    so the caller falls back to credit + hashtags only."""
     return ""
 
 
 def generate_caption(media_paths: list, hint: str = "") -> str:
     """Analyses the given media and returns a Signal Europe-flavoured
-    caption (hook line, Europe-angle context sentence, one comment-farm
-    question). Returns "" if the LLM isn't configured or fails, letting
-    the caller default to credit + hashtags."""
+    caption. Returns "" if GEMINI_API_KEY isn't set or the call fails,
+    letting the caller default to credit + hashtags."""
     if not _is_configured():
         return _fallback_caption(len(media_paths))
 
     try:
         # imported lazily so the dep is only required when this feature is used
-        from anthropic import Anthropic
+        from google import genai
+        from google.genai import types as genai_types
     except ImportError:
-        logger.warning("caption_generator: anthropic package not installed")
+        logger.warning("caption_generator: google-genai not installed")
         return _fallback_caption(len(media_paths))
 
-    blocks, temp_paths = _encode_media(media_paths)
+    image_entries, temp_paths = _collect_image_bytes(media_paths)
     try:
-        if not blocks and not hint:
-            # nothing analysable AND no text hint — fall back rather than hallucinate
+        if not image_entries and not hint:
             return _fallback_caption(len(media_paths))
 
         prompt = _USER_PROMPT
         if hint:
-            prompt += f"\n\nExtra context from the sender: {hint.strip()}"
+            prompt += (
+                "\n\nSOURCE CAPTION (from the original poster — use it as "
+                "background context to understand what the post is about, "
+                "and to pull real names, numbers, and facts. DO NOT copy "
+                "its phrasing verbatim, and DO NOT include the source "
+                "poster's own CTAs like 'comment X', 'link in bio', "
+                "'double-tap'. Write your caption in Signal Europe's own "
+                "voice.):\n"
+                f"{hint.strip()}"
+            )
 
-        client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        model = os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL)
+        # Build the multi-part input: images first, prompt last. Gemini
+        # accepts bytes directly via types.Part.from_bytes().
+        parts = [
+            genai_types.Part.from_bytes(data=data, mime_type=mime)
+            for data, mime in image_entries
+        ]
+        parts.append(prompt)
+
+        client = genai.Client(api_key=_api_key())
+        model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
         try:
-            response = client.messages.create(
+            response = client.models.generate_content(
                 model=model,
-                max_tokens=400,
-                system=_SYSTEM_PROMPT,
-                messages=[{
-                    "role": "user",
-                    "content": blocks + [{"type": "text", "text": prompt}],
-                }],
+                contents=parts,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=_SYSTEM_PROMPT,
+                    max_output_tokens=400,
+                    temperature=0.7,
+                ),
             )
         except Exception:  # noqa: BLE001
-            logger.exception("caption_generator: API call failed")
+            logger.exception("caption_generator: Gemini API call failed")
             return _fallback_caption(len(media_paths))
 
-        text_parts = [b.text for b in response.content if getattr(b, "type", "") == "text"]
-        caption = "\n".join(text_parts).strip()
+        caption = (response.text or "").strip()
         return caption or _fallback_caption(len(media_paths))
     finally:
-        # clean up any thumbnails we extracted from videos
         for p in temp_paths:
             try:
                 p.unlink(missing_ok=True)
