@@ -69,13 +69,16 @@ def upload_media(local_path: str, media_type: str = "video") -> str:
 
     try:
         if media_type == "image":
-            # Convert to JPEG and pad to a 1080x1080 square AT UPLOAD TIME
-            # (eager transformation), then serve the resulting derived
-            # asset's URL. This avoids on-the-fly URL transformations —
-            # Instagram's media fetcher fails on those (returns "could not
-            # retrieve media from URI"), whether because of the commas in
-            # the path or Cloudinary strict-transform settings. A
-            # pre-generated eager asset is delivered like any plain upload.
+            # Convert to JPEG AT UPLOAD TIME (eager transformation) and
+            # serve the resulting derived asset's URL. We deliberately do
+            # NOT pad to a square — that added black bars to portrait/
+            # landscape source images. crop="limit" only *downscales* to
+            # fit within 1080x1080 (never upscales, never pads), so the
+            # original aspect ratio is preserved and Instagram shows it at
+            # the source post's proportions. Serving the eager (derived)
+            # URL avoids on-the-fly URL transformations, which Instagram's
+            # media fetcher fails to retrieve ("could not retrieve media
+            # from URI").
             result = cloudinary.uploader.upload(
                 local_path,
                 resource_type="image",
@@ -83,8 +86,7 @@ def upload_media(local_path: str, media_type: str = "video") -> str:
                 eager=[{
                     "width": 1080,
                     "height": 1080,
-                    "crop": "pad",
-                    "background": "auto",
+                    "crop": "limit",
                 }],
                 eager_async=False,
             )
