@@ -319,30 +319,47 @@ def download(url: str) -> DownloadedPost:
 
     # Two-phase: first extract info without downloading so we can
     # decide per-entry how to fetch it (yt-dlp for videos, requests
-    # for image-only entries). This survives IG posts that are
-    # image-only, which the video-format selector otherwise chokes on.
+    # for image-only entries).
+    yt_dlp_error: Exception | None = None
+    info = None
     try:
         with yt_dlp.YoutubeDL({**ydl_opts, "skip_download": True}) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:  # noqa: BLE001
-        raise DownloadError(f"failed to extract info from {url}: {exc}") from exc
+        yt_dlp_error = exc
 
-    if info is None:
-        raise DownloadError(f"yt-dlp returned no info for {url}")
+    items: list = []
+    if info is not None:
+        entries = info.get("entries") if info.get("_type") == "playlist" else [info]
+        entries = [e for e in entries if e]
+        for entry in entries:
+            item = _fetch_entry(entry, ydl_opts)
+            if item is not None:
+                items.append(item)
 
-    entries = info.get("entries") if info.get("_type") == "playlist" else [info]
-    entries = [e for e in entries if e]
-    if not entries:
-        raise DownloadError(f"no media found at {url}")
-
-    items = []
-    for entry in entries:
-        item = _fetch_entry(entry, ydl_opts)
-        if item is not None:
-            items.append(item)
+    # Instaloader fallback for IG posts that yt-dlp can't handle
+    # (image-only carousels usually crash its extractor with "No video
+    # formats found"). Only attempt for Instagram — Twitter's covered
+    # fine by yt-dlp alone.
+    fallback_error: Exception | None = None
+    if not items and platform == "instagram":
+        try:
+            fallback = _fetch_via_instaloader(url)
+            if fallback:
+                # replace metadata + items with what instaloader got
+                return fallback
+        except Exception as exc:  # noqa: BLE001
+            fallback_error = exc
 
     if not items:
-        raise DownloadError(f"couldn't download any media from {url}")
+        detail = []
+        if yt_dlp_error:
+            detail.append(f"yt-dlp: {yt_dlp_error}")
+        if fallback_error:
+            detail.append(f"instaloader: {fallback_error}")
+        if not detail:
+            detail.append("no media found")
+        raise DownloadError(f"couldn't download any media from {url} — " + "; ".join(detail))
 
     # metadata (caption / uploader) comes from the top-level info for
     # playlists, from the entry itself for singletons
@@ -357,6 +374,138 @@ def download(url: str) -> DownloadedPost:
         source_url=url,
         platform=platform,
     )
+
+
+def _fetch_via_instaloader(url: str) -> DownloadedPost | None:
+    """Fallback IG downloader for posts yt-dlp chokes on (image-only
+    carousels, some new post types). Uses instaloader, which talks to
+    IG's own JSON endpoints rather than scraping the HTML.
+
+    Uses the same IG_COOKIES_B64 env var as yt-dlp so both share the
+    same throwaway session — just needs the sessionid cookie.
+    """
+    import instaloader
+    m = re.search(r"/(?:p|reel|reels)/([A-Za-z0-9_-]+)", url)
+    if not m:
+        return None
+    shortcode = m.group(1)
+
+    L = instaloader.Instaloader(
+        download_pictures=False,   # we handle IO ourselves so we know the exact path
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False,
+        quiet=True,
+    )
+    _apply_instaloader_session(L)
+
+    post = instaloader.Post.from_shortcode(L.context, shortcode)
+
+    items: list = []
+
+    def _add(source_url: str, is_video: bool, width: int = 0, height: int = 0,
+             duration: float = 0.0, idx: int = 0) -> None:
+        entry_id = f"{shortcode}_{idx}"
+        if is_video:
+            path = _download_binary(source_url, entry_id, ext="mp4")
+            if path:
+                items.append(MediaItem(
+                    local_path=path, media_type="video",
+                    width=width, height=height, duration=duration,
+                ))
+        else:
+            path = _download_image_via_requests(source_url, entry_id)
+            if path:
+                items.append(MediaItem(
+                    local_path=path, media_type="image",
+                    width=width, height=height,
+                ))
+
+    if post.typename == "GraphSidecar":
+        for i, node in enumerate(post.get_sidecar_nodes()):
+            if node.is_video:
+                _add(node.video_url, True,
+                     getattr(node, "dimensions", (0, 0))[0] if hasattr(node, "dimensions") else 0,
+                     getattr(node, "dimensions", (0, 0))[1] if hasattr(node, "dimensions") else 0,
+                     idx=i)
+            else:
+                _add(node.display_url, False,
+                     getattr(node, "dimensions", (0, 0))[0] if hasattr(node, "dimensions") else 0,
+                     getattr(node, "dimensions", (0, 0))[1] if hasattr(node, "dimensions") else 0,
+                     idx=i)
+    elif post.is_video:
+        _add(post.video_url, True,
+             post.dimensions[0] if post.dimensions else 0,
+             post.dimensions[1] if post.dimensions else 0,
+             float(post.video_duration or 0), idx=0)
+    else:
+        _add(post.url, False,
+             post.dimensions[0] if post.dimensions else 0,
+             post.dimensions[1] if post.dimensions else 0,
+             idx=0)
+
+    if not items:
+        return None
+
+    return DownloadedPost(
+        items=items,
+        caption=(post.caption or "").strip(),
+        owner_username=post.owner_username or "",
+        source_url=url,
+        platform="instagram",
+    )
+
+
+def _apply_instaloader_session(L) -> None:
+    """Feeds instaloader the sessionid cookie from IG_COOKIES_B64 so
+    it can bypass IG's login wall the same way yt-dlp does. Parses the
+    Netscape cookies.txt format for the sessionid + ds_user_id pair."""
+    cookies_path = _cookies_file_path("instagram")
+    if not cookies_path or not cookies_path.exists():
+        return
+    session_id = None
+    user_id = None
+    for line in cookies_path.read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        name, value = parts[5], parts[6]
+        if name == "sessionid":
+            session_id = value
+        elif name == "ds_user_id":
+            user_id = value
+    if not session_id:
+        return
+    # instaloader lets us seed its requests session directly with the
+    # cookies IG expects
+    L.context._session.cookies.set("sessionid", session_id, domain=".instagram.com")
+    if user_id:
+        L.context._session.cookies.set("ds_user_id", user_id, domain=".instagram.com")
+    # instaloader's context also stores the username for API calls;
+    # deriving it from the session is optional — leave it blank
+    L.context.username = None
+
+
+def _download_binary(url: str, entry_id: str, ext: str = "mp4") -> Path | None:
+    """Same shape as _download_image_via_requests but explicit ext,
+    used for video URLs pulled out of instaloader."""
+    import requests
+    try:
+        resp = requests.get(url, timeout=60, stream=True)
+        resp.raise_for_status()
+    except Exception:  # noqa: BLE001
+        return None
+    out = DOWNLOAD_DIR / f"{entry_id}.{ext}"
+    with open(out, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if chunk:
+                f.write(chunk)
+    return out if out.stat().st_size > 0 else None
 
 
 def _extract_handle(info: dict) -> str:
