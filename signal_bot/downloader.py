@@ -399,6 +399,21 @@ def download(url: str) -> DownloadedPost:
     )
 
 
+def _il_dims(obj) -> tuple:
+    """Safely reads (width, height) off an instaloader Post or sidecar
+    node. instaloader's `Post` has no `dimensions` attribute (only
+    sidecar nodes do), and even on nodes it can be missing or None — so
+    we never touch it without guarding. Returns (0, 0) when unknown;
+    callers only use these for aspect-ratio hints, so 0 is harmless."""
+    dims = getattr(obj, "dimensions", None)
+    if not dims:
+        return 0, 0
+    try:
+        return int(dims[0] or 0), int(dims[1] or 0)
+    except (TypeError, ValueError, IndexError):
+        return 0, 0
+
+
 def _fetch_via_instaloader(url: str) -> DownloadedPost | None:
     """Fallback IG downloader for posts yt-dlp chokes on (image-only
     carousels, some new post types). Uses instaloader, which talks to
@@ -449,26 +464,18 @@ def _fetch_via_instaloader(url: str) -> DownloadedPost | None:
 
     if post.typename == "GraphSidecar":
         for i, node in enumerate(post.get_sidecar_nodes()):
+            w, h = _il_dims(node)
             if node.is_video:
-                _add(node.video_url, True,
-                     getattr(node, "dimensions", (0, 0))[0] if hasattr(node, "dimensions") else 0,
-                     getattr(node, "dimensions", (0, 0))[1] if hasattr(node, "dimensions") else 0,
-                     idx=i)
+                _add(node.video_url, True, w, h, idx=i)
             else:
-                _add(node.display_url, False,
-                     getattr(node, "dimensions", (0, 0))[0] if hasattr(node, "dimensions") else 0,
-                     getattr(node, "dimensions", (0, 0))[1] if hasattr(node, "dimensions") else 0,
-                     idx=i)
+                _add(node.display_url, False, w, h, idx=i)
     elif post.is_video:
-        _add(post.video_url, True,
-             post.dimensions[0] if post.dimensions else 0,
-             post.dimensions[1] if post.dimensions else 0,
-             float(post.video_duration or 0), idx=0)
+        w, h = _il_dims(post)
+        _add(post.video_url, True, w, h,
+             float(getattr(post, "video_duration", 0) or 0), idx=0)
     else:
-        _add(post.url, False,
-             post.dimensions[0] if post.dimensions else 0,
-             post.dimensions[1] if post.dimensions else 0,
-             idx=0)
+        w, h = _il_dims(post)
+        _add(post.url, False, w, h, idx=0)
 
     if not items:
         return None
