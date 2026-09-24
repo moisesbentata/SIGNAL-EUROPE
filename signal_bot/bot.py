@@ -55,41 +55,52 @@ def _allowed_user_ids() -> set:
     return {int(x.strip()) for x in raw.split(",") if x.strip()}
 
 
+_PLATFORM_LABEL = {
+    "instagram": "Instagram",
+    "twitter": "X",
+}
+
+
 def _build_caption(video: downloader.DownloadedVideo, custom_hook: str = "") -> str:
-    """Signal Europe's own caption for a reposted reel.
+    """Signal Europe's own caption for a reposted video.
 
     Deliberately ignores the original poster's caption — those routinely
     contain CTAs that make no sense on our account ("comment 80 for the
     link", "double-tap if you agree", etc). If the user provided
     additional text alongside the link, it becomes the hook. Credits go
-    at the bottom, above the hashtags.
+    at the bottom, above the hashtags, and name the source platform so
+    "@handle" isn't ambiguous when we're reposting from X.
     """
     parts = []
     if custom_hook:
         parts.append(custom_hook.strip())
 
-    credit_lines = []
     if video.owner_username:
-        credit_lines.append(f"🎥 Original: @{video.owner_username}")
-    if credit_lines:
-        parts.append("\n".join(credit_lines))
+        platform_label = _PLATFORM_LABEL.get(video.platform, "")
+        suffix = f" on {platform_label}" if platform_label else ""
+        parts.append(f"🎥 Original: @{video.owner_username}{suffix}")
 
     parts.append("#SignalEurope #EuropeanVC #AI #Startups #TechEurope")
     return "\n\n".join(parts)
 
 
-# matches an IG post/reel URL embedded anywhere in a message (not just
-# at the very start, so the user can include a custom hook alongside it)
-_IG_URL_IN_TEXT_RE = re.compile(
-    r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels)/[A-Za-z0-9_-]+/?[^\s]*",
+# matches a supported post URL (Instagram or Twitter/X) embedded
+# anywhere in a message (not just at the very start, so the user can
+# include a custom hook alongside it)
+_SUPPORTED_URL_IN_TEXT_RE = re.compile(
+    r"https?://(?:www\.|mobile\.)?(?:"
+    r"instagram\.com/(?:p|reel|reels)/[A-Za-z0-9_-]+"
+    r"|(?:twitter\.com|x\.com)/[A-Za-z0-9_]+/status/\d+"
+    r")/?[^\s]*",
     re.IGNORECASE,
 )
 
 
 def _parse_link_message(text: str) -> tuple:
-    """Extracts (ig_url, custom_hook) from a message. custom_hook is
-    everything else in the message stripped clean; empty if nothing."""
-    m = _IG_URL_IN_TEXT_RE.search(text)
+    """Extracts (url, custom_hook) from a message. Returns (None, '') if
+    no supported URL found. custom_hook is everything else in the
+    message stripped clean; empty if nothing."""
+    m = _SUPPORTED_URL_IN_TEXT_RE.search(text)
     if not m:
         return None, ""
     hook = (text[: m.start()] + " " + text[m.end():]).strip()
@@ -129,10 +140,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     qe = os.getenv("QUIET_HOURS_END", "8")
     tz = os.getenv("POSTING_TIMEZONE", "Europe/Madrid")
     await update.message.reply_text(
-        "Send me an Instagram post or reel link and I'll queue it for the "
-        "Signal Europe account. Add your own hook line before or after the "
-        "link and it becomes the caption — otherwise you get credit + hashtags "
-        "only, and the original poster's caption is *not* copied over.\n\n"
+        "Send me an Instagram or Twitter/X video link and I'll queue it "
+        "for the Signal Europe account. Add your own hook line before or "
+        "after the link and it becomes the caption — otherwise you get "
+        "credit + hashtags only, and the original poster's caption is "
+        "*not* copied over.\n\n"
         "Or send a NEWS message like:\n"
         "```\n"
         "NEWS\n"
@@ -241,10 +253,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     url, custom_hook = _parse_link_message(text)
     if not url:
         await update.message.reply_text(
-            "That doesn't look like an Instagram post/reel link. Send a URL like "
-            "https://www.instagram.com/reel/XXXXXXXXX/ — optionally with your own "
-            "hook line before or after it. Or start with NEWS to build a branded "
-            "news Reel from text."
+            "That doesn't look like a supported video link. Accepted:\n"
+            "• Instagram: https://www.instagram.com/reel/XXXXXXXXX/\n"
+            "• Twitter/X: https://x.com/user/status/1234567890\n\n"
+            "Optionally add your own hook line before or after the URL. Or "
+            "start with NEWS to build a branded news Reel from text."
         )
         return
 
