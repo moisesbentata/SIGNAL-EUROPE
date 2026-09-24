@@ -39,7 +39,15 @@ from telegram.ext import (
 
 from pathlib import Path
 
-from signal_bot import downloader, graph_api, news_graphic, news_video, reposts, scheduler
+from signal_bot import (
+    caption_generator,
+    downloader,
+    graph_api,
+    news_graphic,
+    news_video,
+    reposts,
+    scheduler,
+)
 from signal_bot.queue import QueueStore
 
 NEWS_ASSETS_DIR = Path("data/news_assets")
@@ -61,26 +69,46 @@ _PLATFORM_LABEL = {
 }
 
 
+HASHTAGS = "#SignalEurope #EuropeanVC #AI #Startups #TechEurope"
+
+
 def _build_caption(post: downloader.DownloadedPost, custom_hook: str = "") -> str:
     """Signal Europe's own caption for a reposted post.
 
     Deliberately ignores the original poster's caption — those routinely
     contain CTAs that make no sense on our account ("comment 80 for the
-    link", "double-tap if you agree", etc). If the user provided
-    additional text alongside the link, it becomes the hook. Credits go
-    at the bottom, above the hashtags, and name the source platform so
-    "@handle" isn't ambiguous when we're reposting from X.
+    link", "double-tap if you agree", etc).
+
+    If the user provided their own hook alongside the link, that wins.
+    Otherwise we ask Claude vision to analyse the downloaded media and
+    generate a hook + Europe-angle context sentence + comment-farm
+    question. If no ANTHROPIC_API_KEY is configured (or the LLM call
+    fails), we fall back to credit + hashtags only.
     """
     parts = []
     if custom_hook:
         parts.append(custom_hook.strip())
+    else:
+        media_paths = [str(i.local_path) for i in post.items]
+        # pass the source's own caption as a text hint — even though we
+        # don't reprint it verbatim, it gives Claude context about what
+        # the post is about (especially useful for video-only posts
+        # where the visual alone doesn't say much)
+        hint = post.caption.strip()[:2000] if post.caption else ""
+        try:
+            llm_caption = caption_generator.generate_caption(media_paths, hint=hint)
+        except Exception:  # noqa: BLE001 - LLM never fails the pipeline
+            logger.exception("caption_generator raised")
+            llm_caption = ""
+        if llm_caption:
+            parts.append(llm_caption)
 
     if post.owner_username:
         platform_label = _PLATFORM_LABEL.get(post.platform, "")
         suffix = f" on {platform_label}" if platform_label else ""
         parts.append(f"🎥 Original: @{post.owner_username}{suffix}")
 
-    parts.append("#SignalEurope #EuropeanVC #AI #Startups #TechEurope")
+    parts.append(HASHTAGS)
     return "\n\n".join(parts)
 
 
@@ -524,7 +552,12 @@ async def _tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         media_id = await asyncio.to_thread(_publish_item, item)
         store.mark_posted(item.id, media_id)
         logger.info("tick: published #%s -> media_id=%s", item.id, media_id)
-        await _notify_owners(context, f"✅ Published #{item.id} (media {media_id}).")
+        permalink = await asyncio.to_thread(graph_api.get_media_permalink, media_id)
+        if permalink:
+            msg = f"🚀 Posted #{item.id} — live now:\n{permalink}"
+        else:
+            msg = f"🚀 Posted #{item.id} — live now. (media id {media_id})"
+        await _notify_owners(context, msg)
     except graph_api.GraphAPIError as exc:
         store.mark_failed(item.id, str(exc))
         logger.exception("tick: publish failed for #%s", item.id)

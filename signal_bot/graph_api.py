@@ -89,6 +89,23 @@ def upload_video(local_path: str) -> str:
     return upload_media(local_path, media_type="video")
 
 
+def get_media_permalink(ig_media_id: str) -> str:
+    """Fetches the public instagram.com/p/... permalink for a media
+    the account has already published. Returns "" if the API says no."""
+    _, access_token = _get_credentials()
+    try:
+        resp = requests.get(
+            f"{GRAPH_API_BASE}/{ig_media_id}",
+            params={"fields": "permalink", "access_token": access_token},
+            timeout=30,
+        )
+        if not resp.ok:
+            return ""
+        return resp.json().get("permalink", "") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def get_media_reach(ig_media_id: str) -> int:
     """Fetches reach for a published media item. Returns 0 on any error
     or if the insight isn't available yet (Instagram usually needs a few
