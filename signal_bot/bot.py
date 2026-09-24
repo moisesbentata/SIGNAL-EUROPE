@@ -79,11 +79,12 @@ def _build_caption(post: downloader.DownloadedPost, custom_hook: str = "") -> st
     contain CTAs that make no sense on our account ("comment 80 for the
     link", "double-tap if you agree", etc).
 
-    If the user provided their own hook alongside the link, that wins.
-    Otherwise we ask Claude vision to analyse the downloaded media and
-    generate a hook + Europe-angle context sentence + comment-farm
-    question. If no ANTHROPIC_API_KEY is configured (or the LLM call
-    fails), we fall back to credit + hashtags only.
+    If the user provided their own hook alongside the link, that wins
+    (custom_hook overrides the LLM — send the URL alone to let the LLM
+    write the caption). Otherwise we ask Gemini vision to analyse the
+    downloaded media and generate a hook + Europe-angle context sentence
+    + comment-farm question. If no GEMINI_API_KEY is configured (or the
+    LLM call fails), we fall back to credit + hashtags only.
     """
     parts = []
     if custom_hook:
