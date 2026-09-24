@@ -24,6 +24,7 @@ Setup required (see README.md):
 """
 
 import os
+import tempfile
 import time
 
 import requests
@@ -69,31 +70,33 @@ def upload_media(local_path: str, media_type: str = "video") -> str:
 
     try:
         if media_type == "image":
-            # Convert to JPEG AT UPLOAD TIME (eager transformation) and
-            # serve the resulting derived asset's URL. We deliberately do
-            # NOT pad to a square — that added black bars to portrait/
-            # landscape source images. crop="limit" only *downscales* to
-            # fit within 1080x1080 (never upscales, never pads), so the
-            # original aspect ratio is preserved and Instagram shows it at
-            # the source post's proportions. Serving the eager (derived)
-            # URL avoids on-the-fly URL transformations, which Instagram's
-            # media fetcher fails to retrieve ("could not retrieve media
-            # from URI").
-            result = cloudinary.uploader.upload(
-                local_path,
-                resource_type="image",
-                format="jpg",
-                eager=[{
-                    "width": 1080,
-                    "height": 1080,
-                    "crop": "limit",
-                }],
-                eager_async=False,
-            )
-            eager = result.get("eager") or []
-            if eager and eager[0].get("secure_url"):
-                return eager[0]["secure_url"]
-            # fall back to the base (already JPEG) if eager didn't come back
+            # Do the JPEG conversion + downscale OURSELVES with Pillow,
+            # then upload the finished file PLAINLY, and serve its plain
+            # secure_url (…/upload/v123/<id>.jpg). This is the key to
+            # carousels working: Instagram's media fetcher fails to
+            # retrieve Cloudinary *transformation* URLs — the ones with a
+            # transform segment like `c_limit,h_1080,w_1080/` in the path
+            # (subcode 2207052, "could not retrieve media from URI") —
+            # regardless of whether the derivative is eager or on-the-fly,
+            # most likely because of the commas in the path. A plain
+            # upload URL has no transform segment, so Meta fetches it
+            # fine. thumbnail() only downscales (never upscales, never
+            # pads) so the original aspect ratio is preserved.
+            from PIL import Image  # in requirements.txt (also used elsewhere)
+
+            fd, tmp_jpg = tempfile.mkstemp(prefix="ig_upload_", suffix=".jpg")
+            os.close(fd)
+            try:
+                with Image.open(local_path) as im:
+                    im = im.convert("RGB")
+                    im.thumbnail((1080, 1080))
+                    im.save(tmp_jpg, format="JPEG", quality=90, optimize=True)
+                result = cloudinary.uploader.upload(tmp_jpg, resource_type="image")
+            finally:
+                try:
+                    os.unlink(tmp_jpg)
+                except OSError:
+                    pass
             url = result.get("secure_url")
             if not url:
                 raise GraphAPIError(f"Cloudinary upload returned no url: {result}")
