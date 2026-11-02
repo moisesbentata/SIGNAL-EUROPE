@@ -24,7 +24,9 @@ Columns:
   is_repost          0/1
   original_queue_id  nullable — for reposts, the queue id of the source
                      post so we can trace lineage / enforce cooldowns
-  status             pending | posting | posted | failed | cancelled
+  status             draft | pending | posting | posted | failed | cancelled
+                     (draft = awaiting approval from the Telegram preview;
+                     the publish loop ignores it until it's approved)
   ig_media_id        set on `posted` — Instagram media id from Graph API
   posted_at          ISO UTC timestamp when publish actually completed
   error              nullable, populated on `failed`
@@ -177,15 +179,22 @@ class QueueStore:
     # -------------------------------------------------------------- dedup
 
     def find_by_source(self, source_url: str) -> Optional[QueueItem]:
-        """Returns the first non-cancelled/non-failed record for this URL,
-        so duplicate submissions can be refused with a specific message."""
+        """Returns the first live record for this URL, so duplicate
+        submissions can be refused with a specific message. Includes
+        'draft' (awaiting approval) so a link can't be submitted twice
+        while its preview is still open."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM queue WHERE source_url = ? "
-                "AND status IN ('pending', 'posting', 'posted') "
+                "AND status IN ('draft', 'pending', 'posting', 'posted') "
                 "ORDER BY id DESC LIMIT 1",
                 (source_url,),
             ).fetchone()
+        return _row_to_item(row) if row else None
+
+    def get(self, item_id: int) -> Optional[QueueItem]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM queue WHERE id = ?", (item_id,)).fetchone()
         return _row_to_item(row) if row else None
 
     # -------------------------------------------------------------- write
@@ -201,6 +210,7 @@ class QueueStore:
         video_url: str = "",
         is_repost: bool = False,
         original_queue_id: Optional[int] = None,
+        status: str = "pending",
     ) -> int:
         """Enqueue a post.
 
@@ -208,6 +218,10 @@ class QueueStore:
         ("reel" | "photo" | "carousel"). Legacy callers may still pass
         video_url instead; it's stored on the row and _row_to_item
         upgrades it back into a 1-element media_items list on read.
+
+        status defaults to "pending" (schedulable immediately). Pass
+        "draft" to hold it out of the publish loop until it's approved
+        from the Telegram preview.
         """
         if media_items:
             media_items_json = json.dumps(media_items)
@@ -231,8 +245,9 @@ class QueueStore:
                 """
                 INSERT INTO queue (source_url, video_url, media_items_json,
                                     post_type, caption, owner_username,
-                                    scheduled_at, is_repost, original_queue_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    scheduled_at, is_repost, original_queue_id,
+                                    status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     source_url,
@@ -244,9 +259,32 @@ class QueueStore:
                     scheduled_at.astimezone(timezone.utc).isoformat(),
                     1 if is_repost else 0,
                     original_queue_id,
+                    status,
                 ),
             )
             return cur.lastrowid
+
+    def approve(self, item_id: int, scheduled_at: datetime) -> bool:
+        """Move a draft into the live queue with a concrete publish time.
+        Returns False if it wasn't a draft (e.g. already approved or
+        discarded) so a double-tap doesn't re-queue it."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE queue SET status = 'pending', scheduled_at = ? "
+                "WHERE id = ? AND status = 'draft'",
+                (scheduled_at.astimezone(timezone.utc).isoformat(), item_id),
+            )
+            return cur.rowcount == 1
+
+    def discard(self, item_id: int) -> bool:
+        """Drop a draft or still-pending item (the preview's ❌ button)."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE queue SET status = 'cancelled' "
+                "WHERE id = ? AND status IN ('draft', 'pending')",
+                (item_id,),
+            )
+            return cur.rowcount == 1
 
     def mark_posting(self, item_id: int) -> bool:
         """Atomic pending->posting transition. Returns False if the item

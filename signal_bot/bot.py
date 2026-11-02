@@ -30,9 +30,10 @@ import uuid
 from datetime import datetime, time, timezone
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -78,37 +79,65 @@ def _hashtags() -> str:
     return branding.hashtags()
 
 
-def _build_caption(post: downloader.DownloadedPost, custom_hook: str = "") -> str:
-    """Signal Europe's own caption for a reposted post.
+def _require_approval() -> bool:
+    """When true (the default), a submitted link becomes a *draft* that
+    previews in Telegram and only publishes once you tap Approve / Publish
+    now. Set REQUIRE_APPROVAL=false to go back to auto-queue (preview
+    only, no gate)."""
+    return (os.getenv("REQUIRE_APPROVAL", "true").strip().lower()
+            not in ("false", "0", "no", "off"))
 
-    Deliberately ignores the original poster's caption — those routinely
-    contain CTAs that make no sense on our account ("comment 80 for the
-    link", "double-tap if you agree", etc).
 
-    If the user provided their own hook alongside the link, that wins
-    (custom_hook overrides the LLM — send the URL alone to let the LLM
-    write the caption). Otherwise we ask Gemini vision to analyse the
-    downloaded media and generate a hook + Europe-angle context sentence
-    + comment-farm question. If no GEMINI_API_KEY is configured (or the
-    LLM call fails), we fall back to credit + hashtags only.
+def _preview_keyboard(item_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve:{item_id}"),
+            InlineKeyboardButton("🚀 Publish now", callback_data=f"now:{item_id}"),
+        ],
+        [InlineKeyboardButton("❌ Discard", callback_data=f"discard:{item_id}")],
+    ])
+
+
+def _build_caption(post: downloader.DownloadedPost, mode: str = "auto",
+                   instruction: str = "") -> str:
+    """Builds the caption for a reposted post. Three modes:
+
+      * mode="copy"  — mirror the original: use the source poster's own
+        caption verbatim. ("Copy it exactly.")
+      * mode="auto" + instruction="" — let Gemini write a fresh caption
+        in our voice (hook + context + comment-farm question).
+      * mode="auto" + instruction — Gemini writes it but follows the
+        operator's steer (e.g. "make it about France", "shorter", or a
+        finished caption to use as-is). ("The changes you want.")
+
+    A credit line (for links from other creators) and the brand hashtags
+    are appended in every mode. With no GEMINI_API_KEY the auto mode
+    falls back to the operator's instruction if given, else to credit +
+    hashtags only.
     """
     parts = []
-    if custom_hook:
-        parts.append(custom_hook.strip())
+    if mode == "copy":
+        original = (post.caption or "").strip()
+        if original:
+            parts.append(original)
     else:
         media_paths = [str(i.local_path) for i in post.items]
-        # pass the source's own caption as a text hint — even though we
-        # don't reprint it verbatim, it gives Claude context about what
-        # the post is about (especially useful for video-only posts
-        # where the visual alone doesn't say much)
+        # the source caption is background context for the model (names,
+        # numbers) — not reprinted verbatim in auto mode
         hint = post.caption.strip()[:2000] if post.caption else ""
         try:
-            llm_caption = caption_generator.generate_caption(media_paths, hint=hint)
+            llm_caption = caption_generator.generate_caption(
+                media_paths, hint=hint, instruction=instruction
+            )
         except Exception:  # noqa: BLE001 - LLM never fails the pipeline
             logger.exception("caption_generator raised")
             llm_caption = ""
         if llm_caption:
             parts.append(llm_caption)
+        elif instruction.strip():
+            # LLM unavailable but the operator typed something — honour it
+            # literally rather than dropping it
+            parts.append(instruction.strip())
 
     if post.owner_username:
         platform_label = _PLATFORM_LABEL.get(post.platform, "")
@@ -132,9 +161,9 @@ _SUPPORTED_URL_IN_TEXT_RE = re.compile(
 
 
 def _parse_link_message(text: str) -> tuple:
-    """Extracts (url, custom_hook) from a message. Returns (None, '') if
-    no supported URL found. custom_hook is everything else in the
-    message stripped clean; empty if nothing."""
+    """Extracts (url, note) from a message. Returns (None, '') if no
+    supported URL found. note is everything else in the message stripped
+    clean (used as the caption steer); empty if nothing."""
     m = _SUPPORTED_URL_IN_TEXT_RE.search(text)
     if not m:
         return None, ""
@@ -171,26 +200,31 @@ def _fmt_local(dt: datetime) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lo = os.getenv("MIN_POST_GAP_HOURS", "4")
     hi = os.getenv("MAX_POST_GAP_HOURS", "5")
+    gate = ("✅ ON — nothing publishes until you approve the preview"
+            if _require_approval() else "off — items auto-queue after preview")
     await update.message.reply_text(
-        "Send me an Instagram or Twitter/X video link and I'll queue it "
-        "for the Signal Europe account. Add your own hook line before or "
-        "after the link and it becomes the caption — otherwise you get "
-        "credit + hashtags only, and the original poster's caption is "
-        "*not* copied over.\n\n"
-        "Or send a NEWS message like:\n"
+        "Send me an Instagram or Twitter/X link (reel, photo, carousel or "
+        "video) and I'll prepare it for the account, keeping its original "
+        "shape. How the caption is written:\n"
+        "• *Just the link* → I write a fresh caption (hook + question).\n"
+        "• *Link + a note* (\"make it about France\", \"shorter\") → I write "
+        "it your way.\n"
+        "• `/copy <link>` → mirror the original caption *exactly*.\n"
+        "• `/format <link>` → stamp it with your watermark (keeps shape).\n\n"
+        "Or send a NEWS message:\n"
         "```\n"
         "NEWS\n"
         "Your hook headline here\n"
         "Longer description of the news.\n"
         "https://source-url.example (optional)\n"
         "```\n"
-        "…and I'll generate a branded Reel graphic and queue it too.\n\n"
-        "Or `/format <link>` to repost a post stamped with our watermark, "
-        "keeping its original shape (carousel/reel/photo) and order.\n\n"
-        "Every queued item comes back to you as a preview (the video + the "
-        "exact caption) so you see what will publish before it goes live.\n\n"
+        "…and I'll build a branded Reel graphic.\n\n"
+        f"*Preview & approve:* {gate}. Every item comes back as a preview "
+        "(media + exact caption); tap ✅ Approve, 🚀 Publish now, or ❌ "
+        "Discard.\n\n"
         f"Spacing: {lo}–{hi}h between posts\n\n"
-        "Commands: /health, /queue, /cancel <id>, /next, /reposts, /format <link>",
+        "Commands: /health, /queue, /cancel <id>, /next, /reposts, "
+        "/copy <link>, /format <link>",
         parse_mode="Markdown",
     )
 
@@ -365,26 +399,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_news_message(update, context, text)
         return
 
-    url, custom_hook = _parse_link_message(text)
+    url, note = _parse_link_message(text)
     if not url:
         await update.message.reply_text(
-            "That doesn't look like a supported video link. Accepted:\n"
+            "That doesn't look like a supported link. Accepted:\n"
             "• Instagram: https://www.instagram.com/reel/XXXXXXXXX/\n"
             "• Twitter/X: https://x.com/user/status/1234567890\n\n"
-            "Optionally add your own hook line before or after the URL. Or "
-            "start with NEWS to build a branded news Reel from text, or "
-            "/format <link> to repost it stamped with our watermark."
+            "Reels, photos, carousels and videos all work — the post keeps "
+            "its original shape. Options:\n"
+            "• Just the link → I write a fresh caption.\n"
+            "• Link + a note (\"make it about France\", \"shorter\") → I write "
+            "it your way.\n"
+            "• /copy <link> → mirror the original caption exactly.\n"
+            "• /format <link> → stamp it with your watermark.\n"
+            "• NEWS + headline + description → a branded news Reel from text."
         )
         return
 
-    await _ingest_link(update, context, url, custom_hook, apply_watermark=False)
+    await _ingest_link(update, context, url, mode="auto", instruction=note,
+                       apply_watermark=False)
+
+
+async def copy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/copy <link> — repost it *exactly*: the original caption verbatim,
+    media unchanged, same shape. No AI rewrite."""
+    if not await _check_allowed(update):
+        return
+    text = re.sub(r"^/\w+(@\w+)?\s*", "", (update.message.text or "").strip())
+    url, _ = _parse_link_message(text)
+    if not url:
+        await update.message.reply_text(
+            "Usage: /copy <link>\n\nReposts the content with the original "
+            "caption copied exactly, keeping its shape (reel/photo/carousel)."
+        )
+        return
+    await _ingest_link(update, context, url, mode="copy", instruction="",
+                       apply_watermark=False)
 
 
 async def format_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/format <link> [optional hook] — same as sending a link, but every
-    downloaded item is stamped with the Signal Europe watermark before it
-    goes out, so the post reads as our own content. Post shape (carousel/
-    reel/photo) and slide order are preserved."""
+    """/format <link> [note] — same as sending a link, but every
+    downloaded item is stamped with your watermark before it goes out,
+    so the post reads as your own content. Post shape (carousel/reel/
+    photo) and slide order are preserved. An optional note steers the
+    caption the same way a plain link does."""
     if not await _check_allowed(update):
         return
 
@@ -393,41 +451,44 @@ async def format_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # like a normal link message
     text = re.sub(r"^/\w+(@\w+)?\s*", "", text)
 
-    url, custom_hook = _parse_link_message(text)
+    url, note = _parse_link_message(text)
     if not url:
         await update.message.reply_text(
-            "Usage: /format <link> [optional hook]\n\n"
+            "Usage: /format <link> [optional note]\n\n"
             "Give me an Instagram or Twitter/X link and I'll repost the "
-            "content stamped with our watermark, keeping its original "
+            "content stamped with your watermark, keeping its original "
             "shape (carousel stays a carousel, video stays a video)."
         )
         return
 
-    await _ingest_link(update, context, url, custom_hook, apply_watermark=True)
+    await _ingest_link(update, context, url, mode="auto", instruction=note,
+                       apply_watermark=True)
 
 
 async def _ingest_link(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     url: str,
-    custom_hook: str,
+    mode: str,
+    instruction: str,
     apply_watermark: bool,
 ) -> None:
-    """Shared pipeline for a supported link: dedup, download, (optionally
-    watermark), upload each item to Cloudinary, enqueue preserving the
-    source post's shape, and send a preview back to Telegram."""
+    """Shared pipeline for a supported link: dedup, download, hand off to
+    _finalize_post (watermark, upload, caption, enqueue, preview)."""
     store: QueueStore = context.application.bot_data["store"]
 
-    # Dedup: refuse if we've already queued/posted this exact URL. A user
-    # who genuinely wants to repost the same source URL again can wait
-    # for the cooldown to lapse via the weekly picker, or use a
-    # different source URL for the same video.
+    # Dedup: refuse if we've already queued/posted/drafted this exact URL.
     existing = store.find_by_source(url)
     if existing:
         if existing.status == "posted":
             when = _fmt_local(existing.posted_at) if existing.posted_at else "earlier"
             await update.message.reply_text(
                 f"Already posted this link (as #{existing.id}, {when}). Skipping."
+            )
+        elif existing.status == "draft":
+            await update.message.reply_text(
+                f"Already have a preview open for this link (#{existing.id}). "
+                "Approve or discard it first."
             )
         else:
             await update.message.reply_text(
@@ -444,6 +505,24 @@ async def _ingest_link(
         await status_msg.edit_text(f"Download failed: {exc}")
         return
 
+    await _finalize_post(update, context, post, mode, instruction,
+                         apply_watermark, status_msg)
+
+
+async def _finalize_post(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    post: downloader.DownloadedPost,
+    mode: str,
+    instruction: str,
+    apply_watermark: bool,
+    status_msg,
+) -> None:
+    """Shared tail: oversize check, optional watermark, upload each item
+    to Cloudinary, build the caption, enqueue (as a draft when approval
+    is required), and send a preview back to Telegram."""
+    store: QueueStore = context.application.bot_data["store"]
+
     oversized = post.oversized_items()
     if oversized:
         for item in post.items:
@@ -457,6 +536,7 @@ async def _ingest_link(
             f"Instagram's ~{limit_mb:.0f}MB limit. Not uploaded."
         )
         return
+
 
     # Stamp our watermark onto each item (for /format). Done before the
     # upload so Cloudinary/IG and the Telegram preview all get the branded
@@ -491,7 +571,8 @@ async def _ingest_link(
         await status_msg.edit_text(f"Upload failed: {exc}")
         return
 
-    caption = _build_caption(post, custom_hook=custom_hook)
+    caption = _build_caption(post, mode=mode, instruction=instruction)
+    require_approval = _require_approval()
     scheduled_at = scheduler.compute_enqueue_slot(
         store.last_scheduled(), datetime.now(timezone.utc)
     )
@@ -501,27 +582,46 @@ async def _ingest_link(
         caption=caption,
         owner_username=post.owner_username,
         scheduled_at=scheduled_at,
+        status="draft" if require_approval else "pending",
     )
 
-    # Send the media back as a preview — for a single item just that
-    # media, for a carousel a media_group so Telegram displays them in
-    # order. Pass explicit width/height on videos so Telegram doesn't
-    # stretch them to a default aspect ratio (Twitter/X videos are
-    # typically landscape and were showing stretched vertically before).
     wm_note = " · watermarked" if apply_watermark else ""
-    header = (
-        f"Queued as #{item_id} ({post.post_type_hint}{wm_note}), scheduled "
-        f"for {_fmt_local(scheduled_at)}.\n— Caption preview below —"
-    )
+    copy_note = " · exact copy" if mode == "copy" else ""
+    kind = f"{post.post_type_hint}{wm_note}{copy_note}"
+    if require_approval:
+        media_header = f"👀 Preview #{item_id} ({kind}) — caption + buttons below ⤵"
+    else:
+        media_header = (
+            f"Queued #{item_id} ({kind}), scheduled for "
+            f"{_fmt_local(scheduled_at)}.\n— Caption below —"
+        )
+
+    # Media preview is best-effort; the caption message (with the
+    # approve/discard buttons) must always go out so a draft is reachable.
     try:
-        await _send_media_preview(update, post, header)
-        await update.message.reply_text(caption)
-        await status_msg.delete()
+        await _send_media_preview(update, post, media_header)
     except Exception:  # noqa: BLE001
-        await status_msg.edit_text(f"{header}\n\n{caption}")
+        logger.exception("preview media send failed")
+        await update.message.reply_text(media_header)
     finally:
         for item in post.items:
             item.local_path.unlink(missing_ok=True)
+
+    if require_approval:
+        footer = (
+            f"\n\n———\n#{item_id} · {kind}\n"
+            "✅ Approve to add it to the queue · 🚀 Publish now · ❌ Discard"
+        )
+        await update.message.reply_text(
+            caption + footer, reply_markup=_preview_keyboard(item_id)
+        )
+    else:
+        await update.message.reply_text(caption)
+
+    try:
+        await status_msg.delete()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _send_media_preview(update: Update, post: downloader.DownloadedPost, header: str) -> None:
@@ -564,6 +664,64 @@ async def _send_media_preview(update: Update, post: downloader.DownloadedPost, h
     finally:
         for h in handles:
             h.close()
+
+
+async def on_preview_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the inline buttons under a draft preview: Approve (queue
+    it on the normal schedule), Publish now (queue it due immediately),
+    or Discard."""
+    query = update.callback_query
+    if query is None:
+        return
+    user_id = query.from_user.id if query.from_user else None
+    if user_id not in _allowed_user_ids():
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    await query.answer()
+
+    action, _, raw_id = (query.data or "").partition(":")
+    try:
+        item_id = int(raw_id)
+    except ValueError:
+        return
+
+    store: QueueStore = context.application.bot_data["store"]
+    item = store.get(item_id)
+    if item is None:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("That preview is no longer available.")
+        return
+    if item.status != "draft":
+        # already handled (double-tap, or acted on from another device)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            f"#{item_id} was already {item.status}."
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+    if action == "discard":
+        store.discard(item_id)
+        outcome = f"❌ Discarded #{item_id}. Nothing will be posted."
+    elif action == "now":
+        store.approve(item_id, now)
+        outcome = (
+            f"🚀 #{item_id} approved — publishing on the next tick "
+            "(within ~a minute, still subject to the min-gap-since-last-post rule)."
+        )
+    elif action == "approve":
+        slot = scheduler.compute_enqueue_slot(store.last_scheduled(), now)
+        store.approve(item_id, slot)
+        outcome = f"✅ Approved #{item_id} — scheduled for {_fmt_local(slot)}."
+    else:
+        return
+
+    # drop the buttons so it can't be tapped twice, keep the caption visible
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+    await query.message.reply_text(outcome)
 
 
 # --------------------------------------------------------------- news graphic
@@ -640,6 +798,7 @@ async def handle_news_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         mp4_path.unlink(missing_ok=True)
 
     caption = _build_news_caption(headline, description, source_url)
+    require_approval = _require_approval()
     scheduled_at = scheduler.compute_enqueue_slot(
         store.last_scheduled(), datetime.now(timezone.utc)
     )
@@ -649,22 +808,25 @@ async def handle_news_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         caption=caption,
         owner_username="",
         scheduled_at=scheduled_at,
+        status="draft" if require_approval else "pending",
     )
+
+    if require_approval:
+        preview_caption = f"👀 Preview #{item_id} (news Reel). Approve, publish now, or discard."
+        keyboard = _preview_keyboard(item_id)
+    else:
+        preview_caption = f"Queued as #{item_id}, scheduled for {_fmt_local(scheduled_at)}."
+        keyboard = None
 
     # send the preview PNG back to Telegram so you see what will publish
     try:
         with open(png_path, "rb") as f:
             await update.message.reply_photo(
-                photo=f,
-                caption=(
-                    f"Queued as #{item_id}, scheduled for {_fmt_local(scheduled_at)}."
-                ),
+                photo=f, caption=preview_caption, reply_markup=keyboard,
             )
         await status_msg.delete()
     except Exception:  # noqa: BLE001 - preview send is best-effort
-        await status_msg.edit_text(
-            f"Queued as #{item_id}, scheduled for {_fmt_local(scheduled_at)}."
-        )
+        await status_msg.edit_text(preview_caption, reply_markup=keyboard)
 
 
 # --------------------------------------------------------------- publishing tick
@@ -777,7 +939,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("next", next_cmd))
     app.add_handler(CommandHandler("reposts", reposts_cmd))
     app.add_handler(CommandHandler("format", format_cmd))
+    app.add_handler(CommandHandler("copy", copy_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
+    app.add_handler(CallbackQueryHandler(on_preview_action))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     if app.job_queue is None:

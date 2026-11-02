@@ -149,10 +149,13 @@ def _fallback_caption(_num_media: int) -> str:
     return ""
 
 
-def generate_caption(media_paths: list, hint: str = "") -> str:
+def generate_caption(media_paths: list, hint: str = "", instruction: str = "") -> str:
     """Analyses the given media and returns a Signal Europe-flavoured
-    caption. Returns "" if GEMINI_API_KEY isn't set or the call fails,
-    letting the caller default to credit + hashtags."""
+    caption. `hint` is the source poster's caption (background context);
+    `instruction` is the operator's own steer for this post ("make it
+    about France", "shorter", or even a finished caption to use as-is).
+    Returns "" if GEMINI_API_KEY isn't set or the call fails, letting the
+    caller default to credit + hashtags."""
     if not _is_configured():
         return _fallback_caption(len(media_paths))
 
@@ -180,6 +183,16 @@ def generate_caption(media_paths: list, hint: str = "") -> str:
                 "'double-tap'. Write your caption in Signal Europe's own "
                 "voice.):\n"
                 f"{hint.strip()}"
+            )
+        if instruction and instruction.strip():
+            prompt += (
+                "\n\nOPERATOR INSTRUCTION (highest priority — this is what "
+                "the account owner wants for THIS post; follow it over the "
+                "defaults above. If it reads like a finished caption, use "
+                "it as-is; if it's a direction like 'make it funnier' or "
+                "'focus on France', apply it while keeping the required "
+                "format):\n"
+                f"{instruction.strip()}"
             )
 
         # Build the multi-part input: images first, prompt last. Gemini

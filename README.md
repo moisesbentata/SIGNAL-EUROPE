@@ -21,12 +21,15 @@ coding required.
 
 | You send… | It does… |
 |---|---|
-| An Instagram or X link | Downloads the media, writes a caption, queues a repost in the **same shape** (reel / photo / carousel, slide order preserved) |
-| `/format <link>` | Same, but stamps your **watermark** on every item so it reads as your own content |
-| A `NEWS` message + headline + description | Builds a branded 1080×1920 news Reel graphic and queues it |
+| An Instagram or X link | Downloads the media, writes a caption, and sends you a **preview to approve** — reposts in the **same shape** (reel / photo / carousel, slide order preserved) |
+| A link **+ a note** ("make it about France", "shorter") | Writes the caption **your way** |
+| `/copy <link>` | Mirrors the **original caption exactly** — no AI rewrite |
+| `/format <link>` | Stamps your **watermark** on every item so it reads as your own content |
+| A `NEWS` message + headline + description | Builds a branded 1080×1920 news Reel graphic |
 | `/health` | Shows which credentials are set and what each missing one disables |
 
-- **Paced queue** — posts chain onto each other with a random 4–5h gap, so sending 3 links at once spreads them out instead of burst-posting.
+- **Preview & approve** — every submission comes back as a preview (media + exact caption) with ✅ Approve / 🚀 Publish now / ❌ Discard buttons. Nothing publishes until you tap one. (Turn the gate off with `REQUIRE_APPROVAL=false` to auto-queue.)
+- **Paced queue** — approved posts chain onto each other with a random 4–5h gap, so a batch spreads out instead of burst-posting.
 - **Weekly repost picker** — every Sunday it re-queues your top posts of the week (by Instagram reach) across the coming week.
 - **AI captions** — hook line + a European-angle context sentence + a comment-farming question, generated from the media with Google Gemini (free tier). Falls back to credit + hashtags if you skip the Gemini key.
 - **Preview before it posts** — every queued item comes back to you in Telegram so you see exactly what will publish.
@@ -155,13 +158,14 @@ Run `/health` any time to see which of these you've set.
 ## Commands
 
 - `/health` — configuration checklist: what's set, what's missing, what each unlocks.
-- `/start` — hello + current spacing settings.
+- `/start` — hello + current spacing/approval settings.
 - `/queue` — list pending items with scheduled times.
 - `/cancel <id>` — remove a pending item.
 - `/next` — bump the next item to now (still respects the min-gap-since-last-post rule).
 - `/reposts` — run the weekly repost picker now.
+- `/copy <link>` — repost with the original caption copied exactly.
 - `/format <link>` — repost stamped with your watermark.
-- Send `NEWS` + a headline + description to build a branded news Reel.
+- Send a link **+ a note** to steer the caption; send `NEWS` + headline + description to build a branded news Reel.
 
 ---
 
