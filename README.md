@@ -1,107 +1,171 @@
-# Signal Europe — repost bot
+# Signal Europe — Instagram repost bot
 
-A Telegram bot for the `Signal Europe` Instagram account: send it an
-Instagram post/reel link and it downloads the video, queues it, and
-publishes it to your IG account via the official Graph API — pacing
-posts out with configurable spacing and quiet hours so the account
-doesn't get flagged for burst-posting. It also picks your best-
-performing posts every week and re-queues them.
+A Telegram bot that reposts to **your** Instagram account. You message it
+an Instagram or Twitter/X link; it downloads the media, writes an
+AI-generated caption (hook + engagement question), and publishes it to
+your IG account through Instagram's official Graph API — pacing posts a
+few hours apart so the account doesn't look spammy. It also re-queues your
+best-performing posts each week.
 
-## How it works
+Everything is configured with environment variables, so you can run your
+**own** copy — your Telegram bot, your Instagram account — without
+touching the code. This guide walks you through it start to finish; no
+coding required.
 
-```
-You (Telegram) --link--> bot --downloads (yt-dlp)--> uploads once to your
-video host --SQLite queue--> tick loop publishes when a slot's available
-                                                            │
-                                          Sunday 22:00 ─────┴── weekly repost picker
-                                                                (top N by IG reach)
-```
+> ⏱️ Realistic time to set up: **~30–45 min**, most of it the one-time
+> Instagram/Meta developer setup. You do it once.
 
-- **Queue-based posting**: every link goes into a persistent queue with a scheduled time. New items chain onto the last-scheduled item plus a random gap in `[MIN_POST_GAP_HOURS, MAX_POST_GAP_HOURS]` (default 4-5h), then get snapped past **quiet hours** (default 23:00-08:00 Europe/Madrid) if they'd land inside. Send 3 links in 5 minutes → they publish across ~12h instead of all at once.
-- **Weekly repost picker**: every Sunday 22:00 (local time), pulls Instagram reach numbers for posts from the past 7 days, picks the top N (default 3), and re-queues them spread across the coming week. Skips anything already reposted in the last 30 days (cooldown), and only considers posts ≥48h old (fresh posts haven't collected representative numbers). Reposts get a small caption prefix so Instagram doesn't flag them as identical duplicate content.
-- **Duplicate refusal**: send the same IG link twice → the second time the bot tells you when the first was queued/posted and refuses.
-- **Download**: `signal_bot/downloader.py` uses `yt-dlp` at highest available quality (no re-encoding). Works for public posts only. Videos over Instagram's ~100MB Reels API limit fail with a clear message rather than being silently downgraded.
-- **Publish**: `signal_bot/graph_api.py` uses Meta's official Graph API. Each video is uploaded to your video host once — the returned public URL is stored in the queue DB and reused if the post is later re-queued, so reposting doesn't hit the download/upload path again.
-- **Access control**: only Telegram user IDs listed in `TELEGRAM_ALLOWED_USER_IDS` can trigger anything. Without it the bot refuses to run.
+---
 
-## Commands
+## What it can do
 
-- `/start` — hello message, shows current spacing/quiet-hours config.
-- `/queue` — list every pending item with scheduled times and captions.
-- `/cancel <id>` — remove a pending item.
-- `/next` — bump the next item to now (still respects quiet-hours + min-gap-since-last-posted).
-- `/reposts` — trigger the weekly repost picker manually.
+| You send… | It does… |
+|---|---|
+| An Instagram or X link | Downloads the media, writes a caption, queues a repost in the **same shape** (reel / photo / carousel, slide order preserved) |
+| `/format <link>` | Same, but stamps your **watermark** on every item so it reads as your own content |
+| A `NEWS` message + headline + description | Builds a branded 1080×1920 news Reel graphic and queues it |
+| `/health` | Shows which credentials are set and what each missing one disables |
 
-## Setup
+- **Paced queue** — posts chain onto each other with a random 4–5h gap, so sending 3 links at once spreads them out instead of burst-posting.
+- **Weekly repost picker** — every Sunday it re-queues your top posts of the week (by Instagram reach) across the coming week.
+- **AI captions** — hook line + a European-angle context sentence + a comment-farming question, generated from the media with Google Gemini (free tier). Falls back to credit + hashtags if you skip the Gemini key.
+- **Preview before it posts** — every queued item comes back to you in Telegram so you see exactly what will publish.
+- **Access control** — only the Telegram user IDs you list can make it post.
 
-### 1. Install dependencies
+---
+
+## The 4 things you need to connect
+
+You'll collect a handful of values and paste them in as environment
+variables. Here's the map — details for each below.
+
+| What | Required? | Unlocks | Free? |
+|---|---|---|---|
+| **Telegram bot** | ✅ yes | The bot itself | Free |
+| **Instagram Graph API** | ✅ yes | Publishing to your IG | Free |
+| **Cloudinary** | ✅ yes | Media hosting (IG fetches posts from a public URL) | Free tier |
+| **Google Gemini** | optional | AI captions (hook + question) | Free tier |
+
+Two more optional ones (`IG_COOKIES_B64`, `SCRAPER_PROXY`) help with
+downloading source posts reliably from the cloud — see
+[Downloading reliably](#downloading-reliably-optional-but-recommended).
+
+---
+
+## Step 1 — Telegram bot (5 min)
+
+1. Open Telegram, message [@BotFather](https://t.me/BotFather), send `/newbot`, and follow the prompts (pick a name and a username ending in `bot`).
+2. BotFather gives you a **token** like `12345678:AA...`. That's your `TELEGRAM_BOT_TOKEN`.
+3. Message [@userinfobot](https://t.me/userinfobot); it replies with your numeric **user ID**. That's your `TELEGRAM_ALLOWED_USER_IDS` (comma-separate if more than one person should be allowed to post).
+
+## Step 2 — Instagram Graph API (20–30 min, one-time)
+
+This is the fiddly part, but you only do it once.
+
+1. **Make the IG account a Business or Creator account**: Instagram app → Settings → *Account type and tools* → Switch to professional account.
+2. **Create a Facebook Page** and link your IG account to it (IG app → Settings → *Accounts Center* / *Linked accounts*). The Page can be empty; it just has to exist and be linked.
+3. Go to [developers.facebook.com](https://developers.facebook.com) → **My Apps** → *Create App* → type **Business**. Add the **Instagram** product (Instagram Graph API).
+4. Using the Graph API Explorer (or the app dashboard), generate an access token with these permissions: `instagram_basic`, `instagram_content_publish`, `pages_show_list`, `instagram_manage_insights` (the last one is what lets the weekly repost picker read reach — without it it does nothing).
+5. **Convert it to a long-lived token** so it lasts ~60 days instead of 1 hour, and ideally a permanent Page token. (The bot's `graph_api.py` uses whatever you give it; see the token exchange docs linked below.)
+6. Find your **IG Business Account ID**: `GET /{your-page-id}?fields=instagram_business_account&access_token=…` in the Graph API Explorer.
+
+Put the token in `IG_ACCESS_TOKEN` and the id in `IG_BUSINESS_ACCOUNT_ID`.
+
+> You do **not** need to submit the app for review — your own account uses it in Development Mode. Review is only needed if *other people's* accounts will use your app.
+>
+> Token exchange reference: [Long-lived tokens](https://developers.facebook.com/docs/facebook-login/guides/access-tokens/get-long-lived) · [Content Publishing API](https://developers.facebook.com/docs/instagram-platform/content-publishing).
+
+## Step 3 — Cloudinary (3 min)
+
+Instagram's API fetches each post from a public URL, so media is uploaded
+to Cloudinary first.
+
+1. Sign up free at [cloudinary.com](https://cloudinary.com).
+2. Dashboard → **API Environment variable** — copy the whole value, which looks like `cloudinary://123456789:abcdef@your-cloud-name`.
+3. Paste it verbatim into `CLOUDINARY_URL`.
+
+## Step 4 — Google Gemini (optional, 2 min)
+
+For AI captions. Skip it and you get credit + hashtags only.
+
+1. Go to [aistudio.google.com/apikey](https://aistudio.google.com/apikey) → *Create API key* (no card needed).
+2. Paste it into `GEMINI_API_KEY`.
+
+---
+
+## Deploying on Railway (recommended)
+
+The bot has to stay running to receive messages and drain the queue, so
+run it on a host, not your laptop. [Railway](https://railway.app) is the
+easiest.
+
+1. **Get the code**: fork this repo on GitHub (or push your own copy).
+2. In [railway.app](https://railway.app): *New Project* → *Deploy from GitHub repo* → pick the repo. Railway reads `railway.json` and starts it with `python main_bot.py`.
+3. Open the service → **Variables** → add each value you collected above. At minimum:
+   ```
+   TELEGRAM_BOT_TOKEN
+   TELEGRAM_ALLOWED_USER_IDS
+   IG_BUSINESS_ACCOUNT_ID
+   IG_ACCESS_TOKEN
+   CLOUDINARY_URL
+   GEMINI_API_KEY          (optional)
+   DATA_DIR=/data
+   ```
+4. **Add a volume** (optional but recommended): service → *Variables/Settings* → *Volumes* → mount at `/data`, and set `DATA_DIR=/data`. Without it the queue resets on every redeploy (posts already published stay published; only *pending* ones are lost).
+5. Watch the deploy logs — the bot prints a **configuration checklist** on startup showing exactly what's set and what's missing.
+6. Open Telegram, message your bot `/health` to confirm everything's green, then send it a link.
+
+> `.env.example` lists **every** variable with inline explanations — open it for the full reference, including the optional cookies/proxy settings.
+
+### Running locally instead
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 2. Create the Telegram bot
-
-1. Message [@BotFather](https://t.me/BotFather) on Telegram, `/newbot`, follow the prompts.
-2. Copy the token into `TELEGRAM_BOT_TOKEN`.
-3. Message [@userinfobot](https://t.me/userinfobot) for your numeric Telegram user ID, put it in `TELEGRAM_ALLOWED_USER_IDS` (comma-separate if more than one person should be able to trigger posts).
-
-### 3. Instagram Graph API
-
-1. Convert the IG account to **Business** or **Creator** (Instagram app → Settings → Account type).
-2. Create a **Facebook Page** and link the IG account to it.
-3. [developers.facebook.com](https://developers.facebook.com) → create an App → add the **Instagram Graph API** product.
-4. Generate a long-lived access token (60 days, renewable) with `instagram_content_publish`, `pages_show_list`, `instagram_basic`, and `instagram_manage_insights` (this last one is what makes the weekly repost picker work — without it reach queries return empty).
-5. Find `IG_BUSINESS_ACCOUNT_ID` via `GET /{page-id}?fields=instagram_business_account&access_token=…`.
-
-You don't need to submit the app for review — your own account uses it in Development Mode. App review is only required if you want *other* accounts to use it.
-
-### 4. Video hosting
-
-The Graph API fetches video from a URL, not a file upload. Point `VIDEO_HOST_UPLOAD_URL` / `VIDEO_HOST_PUBLIC_BASE_URL` at any host you control (S3 with public read is cheapest). `signal_bot/graph_api.py::upload_video()` is a thin wrapper — swap its body for whatever your host's upload API expects. Videos are uploaded once and the URL is reused forever, so reposts don't re-upload.
-
-### 5. Configure `.env`
-
-```bash
-cp .env.example .env
-```
-
-Fill in the credentials above. The rest have sensible defaults — spacing, quiet hours, repost cadence — but skim them.
-
-### 6. Run it locally
-
-```bash
+cp .env.example .env     # then fill it in
 python main_bot.py
 ```
 
-Message the bot on Telegram with `/start`, then send an IG link.
+---
 
-## Deploying on Railway
+## Downloading reliably (optional but recommended)
 
-The bot needs to stay running to catch messages and drain the queue on schedule.
+Instagram and Twitter block requests from datacenter IPs (which is what
+Railway, AWS, etc. have). So downloads that work on your laptop can fail
+in the cloud with "empty media response" / "login required". Two things
+help:
 
-1. Push this repo to GitHub, connect it in [railway.app](https://railway.app) → New Project → Deploy from GitHub.
-2. In the service Settings → **Variables**, paste every non-blank value from your `.env`. Include `DATA_DIR=/data`.
-3. Settings → **Volumes** → New Volume, mount at `/data`. **This is essential** — Railway wipes the container filesystem on every redeploy, so without a persistent volume the queue and posting history vanish (and scheduled reposts along with them). The free hobby tier includes 5GB, way more than this bot ever needs.
-4. Railway auto-deploys from `railway.json` — start command is `python main_bot.py`.
+- **`IG_COOKIES_B64` / `TWITTER_COOKIES_B64`** — export `cookies.txt` from a browser logged into a **throwaway** IG/X account (not your posting account), base64-encode the file (`base64 -w0 cookies.txt`), and paste the result. This logs the downloader in.
+- **`SCRAPER_PROXY`** — a residential proxy URL (`http://user:pass@host:port`). This is the most reliable fix for cloud blocking; providers run ~$1–3/GB and downloads are tiny. See `.env.example` for details.
 
-Every push to the branch redeploys automatically. The volume persists across deploys, so the queue survives.
+Run `/health` any time to see which of these you've set.
 
-## What the bot deliberately doesn't do
+---
 
-- **No auto-strip of TikTok watermarks** — Instagram demotes watermarked reposts. Check the video before sending the link.
-- **No re-encoding to fit under IG's size limit** — that would lose quality. Videos over ~100MB fail with a clear message.
-- **No confirmation prompts** by default — the assumption is you vet each link before sending it. Flip `REQUIRE_CONFIRMATION=true` in `.env` to add an inline Yes/No step (not currently wired to the new queue flow — filed for later if you actually want it).
-- **No cross-poster** — this posts to one IG account. Not Facebook, not TikTok.
+## Commands
+
+- `/health` — configuration checklist: what's set, what's missing, what each unlocks.
+- `/start` — hello + current spacing settings.
+- `/queue` — list pending items with scheduled times.
+- `/cancel <id>` — remove a pending item.
+- `/next` — bump the next item to now (still respects the min-gap-since-last-post rule).
+- `/reposts` — run the weekly repost picker now.
+- `/format <link>` — repost stamped with your watermark.
+- Send `NEWS` + a headline + description to build a branded news Reel.
+
+---
 
 ## The copyright point, stated plainly
 
-This reposts other people's actual videos to your account. Even with a `🎬 Original: @creator` credit line auto-added to every caption, credit isn't permission. You're the one vetting each link before sending it — the bot has no way to know whether a given repost is actually okay.
+This reposts other people's actual media to your account. The auto-added
+`🎥 Original: @creator` credit line is courtesy, **not** permission — credit
+isn't a license. You are the one vetting each link before you send it; the
+bot can't know whether a given repost is okay. `/format` additionally
+brands the media as yours, which makes that your call to get right.
 
-## Known limitations
+## Good to know
 
-- **yt-dlp Instagram support** breaks when IG changes their site. If downloads start failing, `pip install -U yt-dlp` first.
-- **Access tokens expire** every 60 days. Regenerate before then or the bot goes silent.
-- **Insights availability**: `instagram_manage_insights` permission is required for the weekly repost picker to work. Without it the picker returns zero and no reposts get queued.
-- **Single-process queue**: the SQLite queue assumes one bot process. Don't run multiple copies against the same DB or two ticks could grab the same item.
+- **Access tokens expire** (~60 days unless you made a permanent Page token). Regenerate `IG_ACCESS_TOKEN` before then or the bot goes quiet.
+- **yt-dlp** occasionally breaks when Instagram changes their site; `pip install -U yt-dlp` (it's pinned in `requirements.txt`, bump it) usually fixes downloads.
+- **Single process** — don't run two copies against the same queue DB.
+- **One account per deploy** — each copy posts to exactly one Instagram account. Your friend runs their own copy with their own variables; nothing is shared between them.

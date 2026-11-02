@@ -43,6 +43,7 @@ from pathlib import Path
 
 from signal_bot import (
     caption_generator,
+    config,
     downloader,
     graph_api,
     news_graphic,
@@ -187,7 +188,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Every queued item comes back to you as a preview (the video + the "
         "exact caption) so you see what will publish before it goes live.\n\n"
         f"Spacing: {lo}–{hi}h between posts\n\n"
-        "Commands: /queue, /cancel <id>, /next, /reposts, /format <link>",
+        "Commands: /health, /queue, /cancel <id>, /next, /reposts, /format <link>",
+        parse_mode="Markdown",
+    )
+
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/health — shows which credentials are configured and what each
+    missing one disables, so a fresh deploy can be verified from the
+    phone instead of digging through server logs."""
+    if not await _check_allowed(update):
+        return
+    missing = config.missing_required()
+    header = (
+        "✅ *All set* — the bot can post."
+        if not missing
+        else f"⚠️ *{len(missing)} required setting(s) missing* — can't post yet."
+    )
+    body = "\n\n".join(config.status_lines())
+    await update.message.reply_text(
+        f"{header}\n\n{body}\n\n"
+        "✅ set · ❌ required, missing · ➖ optional, missing",
         parse_mode="Markdown",
     )
 
@@ -732,14 +753,23 @@ def build_app() -> Application:
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
+    # Log a clear configuration checklist at startup so a fresh deploy
+    # tells the operator exactly what's set and what each missing piece
+    # disables, rather than failing cryptically later at publish time.
+    config.preflight(logger)
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in .env")
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not set. Create a bot with @BotFather on "
+            "Telegram and set TELEGRAM_BOT_TOKEN (see SETUP.md)."
+        )
 
     app = Application.builder().token(token).build()
     app.bot_data["store"] = QueueStore()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("queue", queue_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("next", next_cmd))
