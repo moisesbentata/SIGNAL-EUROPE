@@ -42,6 +42,7 @@ from telegram.ext import (
 from pathlib import Path
 
 from signal_bot import (
+    branding,
     caption_generator,
     config,
     downloader,
@@ -73,7 +74,8 @@ _PLATFORM_LABEL = {
 }
 
 
-HASHTAGS = "#SignalEurope #EuropeanVC #AI #Startups #TechEurope"
+def _hashtags() -> str:
+    return branding.hashtags()
 
 
 def _build_caption(post: downloader.DownloadedPost, custom_hook: str = "") -> str:
@@ -113,7 +115,7 @@ def _build_caption(post: downloader.DownloadedPost, custom_hook: str = "") -> st
         suffix = f" on {platform_label}" if platform_label else ""
         parts.append(f"🎥 Original: @{post.owner_username}{suffix}")
 
-    parts.append(HASHTAGS)
+    parts.append(_hashtags())
     return "\n\n".join(parts)
 
 
@@ -573,7 +575,7 @@ def _build_news_caption(headline: str, description: str, source_url: str) -> str
         parts.append(description)
     if source_url:
         parts.append(f"Source: {source_url}")
-    parts.append("#SignalEurope #EuropeanVC #AI #Startups")
+    parts.append(_hashtags())
     return "\n\n".join(parts)
 
 

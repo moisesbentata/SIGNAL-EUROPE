@@ -4,3 +4,9 @@ __pycache__/
 .env
 downloads/
 logs/
+
+# Your branding lives in assets/branding.json + assets/template/ +
+# assets/logo/. These are NOT ignored on purpose: Railway deploys from
+# your GitHub repo, so your template has to be committed to your fork to
+# reach the running bot. Keep them out of a *shared* repo if you don't
+# want others inheriting your look — but in your own fork, commit them.

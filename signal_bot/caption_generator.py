@@ -19,39 +19,61 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from signal_bot import branding
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gemini-2.0-flash"
 MAX_INLINE_MEDIA_BYTES = 5 * 1024 * 1024  # 5MB per attachment
 MAX_ATTACHMENTS = 6  # cap so multi-slide carousels don't blow the context
 
-_SYSTEM_PROMPT = (
-    "You write captions for Signal Europe, an Instagram account covering "
-    "European venture capital, AI, and startup news. Voice: punchy, "
-    "concise, curious. No hype. Facts over adjectives. Emojis only where "
-    "they carry real meaning (flags, arrows) — otherwise none. Never "
-    "invent numbers, names, or nationalities: if it isn't visible or "
-    "clearly implied in the media, don't state it. Prefer a European "
-    "angle when the content supports one; if it genuinely doesn't, don't "
-    "force it — just skip the Europe line."
-)
 
-_USER_PROMPT = (
-    "Write an Instagram caption for this post. Exact format:\n"
-    "Line 1: hook headline, ≤90 characters, no trailing period. Punchy, "
-    "specific.\n"
-    "Blank line.\n"
-    "Line 3: one sentence of context. Where possible, tie it to Europe — "
-    "how this compares to Europe, why it matters for European founders/"
-    "investors, or a European counterpart. Skip this line entirely if "
-    "there's no honest European angle.\n"
-    "Blank line.\n"
-    "Last line: one question aimed at the audience of European "
-    "founders/investors that invites a specific answer in the comments. "
-    "Not rhetorical. Under 120 characters.\n\n"
-    "Return only the caption text, nothing else. No hashtags — those are "
-    "added separately."
-)
+def _system_prompt() -> str:
+    name = branding.brand_name()
+    niche = branding.caption_niche()
+    angle = branding.caption_angle()
+    angle_line = (
+        f"Prefer a {angle} angle when the content supports one; if it "
+        f"genuinely doesn't, don't force it — just skip the {angle} line."
+        if angle else
+        "Lead with whatever angle the content actually supports; don't force one."
+    )
+    return (
+        f"You write captions for {name}, an Instagram account covering "
+        f"{niche}. Voice: punchy, concise, curious. No hype. Facts over "
+        "adjectives. Emojis only where they carry real meaning (flags, "
+        "arrows) — otherwise none. Never invent numbers, names, or "
+        "nationalities: if it isn't visible or clearly implied in the "
+        f"media, don't state it. {angle_line}"
+    )
+
+
+def _user_prompt() -> str:
+    angle = branding.caption_angle()
+    niche = branding.caption_niche()
+    audience = f"{angle} founders/investors" if angle else "the audience"
+    context_line = (
+        f"Line 3: one sentence of context. Where possible, tie it to "
+        f"{angle} — how this compares to {angle} markets, why it matters "
+        f"for {audience}, or a {angle} counterpart. Skip this line "
+        f"entirely if there's no honest {angle} angle.\n"
+        if angle else
+        "Line 3: one sentence of context that adds something the image "
+        "alone doesn't say. Skip it if you'd just be restating the hook.\n"
+    )
+    return (
+        "Write an Instagram caption for this post. Exact format:\n"
+        "Line 1: hook headline, ≤90 characters, no trailing period. Punchy, "
+        "specific.\n"
+        "Blank line.\n"
+        + context_line +
+        "Blank line.\n"
+        "Last line: one question aimed at " + audience + " that invites a "
+        "specific answer in the comments. Not rhetorical. Under 120 "
+        "characters.\n\n"
+        "Return only the caption text, nothing else. No hashtags — those are "
+        "added separately."
+    )
 
 
 class CaptionGenerationError(RuntimeError):
@@ -147,7 +169,7 @@ def generate_caption(media_paths: list, hint: str = "") -> str:
         if not image_entries and not hint:
             return _fallback_caption(len(media_paths))
 
-        prompt = _USER_PROMPT
+        prompt = _user_prompt()
         if hint:
             prompt += (
                 "\n\nSOURCE CAPTION (from the original poster — use it as "
@@ -175,7 +197,7 @@ def generate_caption(media_paths: list, hint: str = "") -> str:
                 model=model,
                 contents=parts,
                 config=genai_types.GenerateContentConfig(
-                    system_instruction=_SYSTEM_PROMPT,
+                    system_instruction=_system_prompt(),
                     max_output_tokens=400,
                     temperature=0.7,
                 ),

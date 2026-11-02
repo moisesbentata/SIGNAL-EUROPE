@@ -32,6 +32,16 @@ coding required.
 - **Preview before it posts** — every queued item comes back to you in Telegram so you see exactly what will publish.
 - **Access control** — only the Telegram user IDs you list can make it post.
 
+## Make it *your* format
+
+Account name, brand colour, hashtags, caption voice, and the whole
+**NEWS graphic design** are controlled by one optional file,
+`assets/branding.json` — no code changes. You can even design the news
+card in **Figma or Canva**, export a 1080×1920 background, and have the
+bot render headlines onto your template. Full walkthrough in
+**[BRANDING.md](BRANDING.md)**. With no branding file, you get the
+default Signal Europe look.
+
 ---
 
 ## The 4 things you need to connect

@@ -1,0 +1,22 @@
+{
+  "brand_name": "EUROMAXXING",
+  "accent_hex": "#FFD400",
+  "hashtags": "#Euromaxxing #Europe #Tech #Startups #AI",
+  "caption": {
+    "niche": "European tech, startups, and culture",
+    "angle": "European"
+  },
+  "news": {
+    "background_image": "assets/template/news_bg.png",
+    "text_color": "#FFFFFF",
+    "muted_color": "#AAB0C0",
+    "badge": { "enabled": true, "text": "BREAKING", "x": 84, "y": 84 },
+    "headline": {
+      "x": 84, "y": 560, "width": 912, "max_lines": 4,
+      "size_max": 110, "size_min": 58
+    },
+    "description": { "x": 84, "width": 912, "size": 44, "line_height": 60, "gap": 60 },
+    "show_bottom_brand": false,
+    "show_top_logo": false
+  }
+}

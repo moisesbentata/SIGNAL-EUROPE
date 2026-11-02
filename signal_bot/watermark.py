@@ -30,9 +30,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from signal_bot import branding
+
 logger = logging.getLogger(__name__)
 
-YELLOW = (252, 238, 10, 255)
 WHITE = (255, 255, 255, 255)
 SCRIM = (10, 14, 26, 170)  # translucent navy behind the wordmark
 
@@ -40,7 +41,14 @@ FONTS_DIR = Path("assets/fonts")
 BOLD_FONT_PATH = FONTS_DIR / "Bold.ttf"
 LOGO_PATH = Path("assets/logo/logo.png")
 
-WORDMARK = "SIGNAL EUROPE"
+
+def _accent_rgba() -> tuple:
+    r, g, b = branding.accent_rgb()
+    return (r, g, b, 255)
+
+
+def _wordmark() -> str:
+    return branding.brand_name().upper()
 
 
 class WatermarkError(RuntimeError):
@@ -80,7 +88,9 @@ def _render_overlay(width: int, height: int):
     font_size = max(int(base * 0.045), 20)
     font = _load_font(font_size)
 
-    text_w = draw.textlength(WORDMARK, font=font)
+    wordmark = _wordmark()
+    accent = _accent_rgba()
+    text_w = draw.textlength(wordmark, font=font)
     ascent, descent = font.getmetrics()
     text_h = ascent + descent
 
@@ -102,11 +112,11 @@ def _render_overlay(width: int, height: int):
 
     star_cx = x1 + pad_x + star_r
     star_cy = (y1 + y2) / 2
-    _star(draw, star_cx, star_cy, star_r, YELLOW)
+    _star(draw, star_cx, star_cy, star_r, accent)
 
     text_x = star_cx + star_r + star_gap
     text_y = y1 + pad_y - descent / 2
-    draw.text((text_x, text_y), WORDMARK, font=font, fill=YELLOW)
+    draw.text((text_x, text_y), wordmark, font=font, fill=accent)
 
     if LOGO_PATH.exists():
         try:
